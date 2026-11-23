@@ -34,6 +34,7 @@
 | `load.sh`（包內生成） | 目標機 | 完整包：`docker load` + 呼叫 gen-env.sh |
 | `agentwiki/gen-env.sh` | 目標機 | 建立 `docker/.env`（官方範本 + `agentwiki/.env.example`）並自動產生帳密 |
 | `agentwiki/setup-models.sh` | 目標機 | 啟動後建立服務帳號、embedding 模型供應商與 API key，印出 kb-stack 設定 |
+| `agentwiki/repo-deploy.sh` | 有 repo 的主機 | 直接從 git repo 部署：`init` / `up` / `update`（git pull 後套用）/ `build` |
 | `update.sh`（包內生成） | 目標機 | 更新包：換 app image，資料保留 |
 | `start.sh` / `stop.sh` | 目標機 | 啟動並等到健康檢查通過 / 停止（volume 保留） |
 
@@ -149,6 +150,42 @@ RAGFLOW_SETUP_EMBEDDING_MODEL=<模型名稱>                            # 跟 em
 - 要換 embedding 服務的位址或 key：instance 已存在時腳本不會改，請到 Web 的模型供應商頁修改，或刪掉
   instance 後重跑。
 - 需要 `python3`（只用標準函式庫）。
+
+## 二之一、直接從 git repo 部署（`repo-deploy.sh`）
+
+主機上有這個 repo、想 `git pull` 之後一個指令就套用，不必每次打包、解壓時用。image 不在 repo 裡，
+仍然要先有：從部署包載入（`docker load -i <包>/images.tar`，最省事），或 `repo-deploy.sh build`
+在本機 build（需要外網）。
+
+```bash
+cd AgentWiki/ragflow
+agentwiki/repo-deploy.sh init --admin-email you@example.com   # 建 runtime/ 與 .env（帳密自動產生）
+agentwiki/repo-deploy.sh up                                   # 同步部署檔並啟動
+nano runtime/docker/.env                                      # 填 RAGFLOW_SETUP_EMBEDDING_*
+agentwiki/repo-deploy.sh setup-models                         # 服務帳號、模型、API key
+
+# 之後每次更新
+agentwiki/repo-deploy.sh update     # git pull --ff-only → 同步 → 有變動才重啟受影響的服務
+agentwiki/repo-deploy.sh status | logs [服務] | down
+```
+
+- **為什麼有 `runtime/`**（預設在 repo 根目錄，`RAGFLOW_RUNTIME_DIR` 可改）：repo 的 `docker/.env` 是
+  上游範本（公開預設密碼），compose 又用 `env_file: .env` 把它灌進容器，不能原地改。部署檔同步到
+  `runtime/`，結構跟部署包一樣，所以 `start.sh`、`gen-env.sh`、`setup-models.sh` 在兩種模式下行為相同。
+  `runtime/` 自帶內容為 `*` 的 `.gitignore`：裡面有 `.env`、`.env.bak-*`（帳密備份）與
+  `kb-stack.ragflow.env`（API key），上游 `.gitignore` 只忽略 `.env` 本身，其他會被 `git add` 掃到。
+- **同步規則**：`git ls-files docker` 的檔案逐一比對，有變才覆寫，舊檔備份到
+  `runtime/docker/.bak-<時間>/`；`runtime/docker/.env` 永遠不被覆寫。新版本加的設定鍵只補進 `.env`
+  沒有的，既有值（尤其帳密）不動。
+- **`update` 的重啟範圍**：`docker/` 沒變只更新腳本、不碰容器；有變就 `compose up -d`（重建設定有變的
+  服務）；`entrypoint.sh` 或 `service_conf.yaml.template` 變了再重啟 `ragflow-cpu`，因為它們是掛進
+  容器的檔案，compose 看不出內容變化。
+- **RAGFlow 本身（Go 程式與前端）在 image 裡**，`git pull` 換不掉。換版要 `repo-deploy.sh build`，
+  或在建置機 build 後傳更新包、`docker load` 再 `repo-deploy.sh up`。
+- **不要在 `dist/` 裡解開部署包來跑。** pack-prod.sh 每次會清掉 `dist/ragflow-prod-<版本>/` 暫存目錄；
+  它發現裡面有 `docker/.env` 時會拒絕打包，避免把正在用的帳密刪掉。部署請放 `dist/` 以外。
+- **接手部署包裝好的資料**：`init --import-env /opt/.../docker/.env`，帳密與 project 名稱沿用。兩種模式
+  用同一個 compose project 時，先 `./stop.sh` 停掉部署包那份，不要同時跑。
 
 ## 三、跟舊版 RAGFlow 並存
 
