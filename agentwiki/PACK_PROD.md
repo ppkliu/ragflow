@@ -82,6 +82,19 @@ nano docker/.env           # 填 RAGFLOW_SETUP_EMBEDDING_BASE_URL / RAGFLOW_SETU
 
 ### docker/.env 與帳密自動產生（`gen-env.sh`）
 
+**.env 集中存放在 `/opt/AgentWiki/shared/env/ragflow.env`。** 主機上有 `/opt/AgentWiki` 時，gen-env.sh 把
+真正的 `.env` 建在那裡（跟 `adapter.env`、`kb-stack.env` 同一處，換版不動），部署目錄的 `docker/.env`
+只是指向它的 symlink。好處：
+
+- 部署目錄或 repo 的 `runtime/` 整個被刪掉，帳密還在；重新解包或 `repo-deploy.sh init` 會自動接回同一份。
+- 部署包與 `repo-deploy.sh` 兩種模式共用同一份 `.env`，切換時不會出現兩套帳密。
+- 已經是一般檔的 `docker/.env`，下次跑 gen-env.sh（load.sh 會跑）時自動搬過去；集中位置已有內容不同的
+  `.env` 時會停下來，不擅自取捨。
+
+`/opt/AgentWiki/shared/env` 要是部署帳號寫得進去（沒有權限時 gen-env.sh 會印出 `sudo mkdir/chown`
+指令）。指定其他位置用 `--env-store <絕對路徑>` 或 `RAGFLOW_ENV_STORE`，不要集中存放用 `--no-env-store`。
+改帳密前的備份（`.bak-<時間>`）放在真正的檔案旁邊。
+
 `docker/.env` 由三層組成：官方範本 `docker/.env.example` → AgentWiki 範本
 `agentwiki.env.example`（repo 裡是 `agentwiki/.env.example`：project 名稱、埠號、帳密欄位）→
 `gen-env.sh` 產生的帳密。load.sh 會自動呼叫 gen-env.sh，參數原樣轉過去。
@@ -93,6 +106,7 @@ nano docker/.env           # 填 RAGFLOW_SETUP_EMBEDDING_BASE_URL / RAGFLOW_SETU
 | `--dry-run` | 只列出會改哪些鍵 |
 | `--rotate` | 所有帳密重新產生（只在還沒有資料時允許） |
 | `--show` | 印出目前的帳密 |
+| `--env-store <路徑>` / `--no-env-store` | 指定 .env 集中存放位置 / 不集中存放 |
 
 產生的帳密：`ELASTIC_PASSWORD`、`MYSQL_PASSWORD`、`MINIO_PASSWORD`、`REDIS_PASSWORD`、
 `DEFAULT_SUPERUSER_PASSWORD`（舊名 `ADMIN_DEFAULT_PASSWORD` 寫成同一個值）。要用自己指定的值，
@@ -182,6 +196,7 @@ agentwiki/repo-deploy.sh status | logs [服務] | down
   容器的檔案，compose 看不出內容變化。
 - **RAGFlow 本身（Go 程式與前端）在 image 裡**，`git pull` 換不掉。換版要 `repo-deploy.sh build`，
   或在建置機 build 後傳更新包、`docker load` 再 `repo-deploy.sh up`。
+- **`dist/` 自帶內容為 `*` 的 `.gitignore`**（pack-prod.sh 建立），數 GB 的打包產物不依賴上游 `.gitignore` 才被排除。
 - **不要在 `dist/` 裡解開部署包來跑。** pack-prod.sh 每次會清掉 `dist/ragflow-prod-<版本>/` 暫存目錄；
   它發現裡面有 `docker/.env` 時會拒絕打包，避免把正在用的帳密刪掉。部署請放 `dist/` 以外。
 - **接手部署包裝好的資料**：`init --import-env /opt/.../docker/.env`，帳密與 project 名稱沿用。兩種模式
