@@ -33,6 +33,7 @@
 | `agentwiki/load-select.sh` | 目標機 | 掃描 / 選擇 / 確認 / 載入 tar.gz（打包時會複製到 `dist/`） |
 | `load.sh`（包內生成） | 目標機 | 完整包：`docker load` + 呼叫 gen-env.sh |
 | `agentwiki/gen-env.sh` | 目標機 | 建立 `docker/.env`（官方範本 + `agentwiki/.env.example`）並自動產生帳密 |
+| `agentwiki/setup-models.sh` | 目標機 | 啟動後建立服務帳號、embedding 模型供應商與 API key，印出 kb-stack 設定 |
 | `update.sh`（包內生成） | 目標機 | 更新包：換 app image，資料保留 |
 | `start.sh` / `stop.sh` | 目標機 | 啟動並等到健康檢查通過 / 停止（volume 保留） |
 
@@ -73,6 +74,8 @@ sha256sum -c ragflow-prod-v1.0.0.tar.gz.sha256
 tar -xzf ragflow-prod-v1.0.0.tar.gz && cd ragflow-prod-v1.0.0
 ./load.sh                  # docker load + gen-env.sh：建立 docker/.env、自動產生帳密
 ./start.sh                 # 啟動，等到 /api/v1/system/healthz 通過
+nano docker/.env           # 填 RAGFLOW_SETUP_EMBEDDING_BASE_URL / RAGFLOW_SETUP_EMBEDDING_MODEL
+./setup-models.sh          # 服務帳號 + embedding 模型 + API key，最後印出 kb-stack 要填的三行
 ./gen-env.sh --show        # 之後要查帳密
 ```
 
@@ -100,8 +103,10 @@ tar -xzf ragflow-prod-v1.0.0.tar.gz && cd ragflow-prod-v1.0.0
 - 改帳密前會把原本的 `.env` 備份成 `.env.bak-<時間>`；`.env` 與備份的權限都是 600。
 - 在 repo 原始碼目錄執行會被擋下：那裡的 `docker/.env` 是上游進版控的範本，不是部署用的。
 - **`vm.max_map_count` 至少 262144**，Elasticsearch 才起得來。start.sh 會檢查並印出修正指令。
-- 第一次啟動時（官方 compose 帶 `--init-superuser`）用上面的 email 與密碼建立超級管理員。登入 Web
-  後到右上角頭像 → API 產生 API key，填進 kb-stack 的 `RAGFLOW_API_KEY`。
+- 第一次啟動時（官方 compose 帶 `--init-superuser`）用上面的 email 與密碼建立超級管理員。
+  **它只能登入 Admin（19381）**：1.0 的 Web 登入與一般 API 都會擋掉超級管理員（`super admin should
+  not login to this page`、`Super user shouldn't access the URL`）。Web 登入、dataset、模型與 API key
+  都要用一般使用者，由下一節的 `setup-models.sh` 建立。
 
 ### 模型供應商不能從 .env 設定
 
@@ -110,10 +115,40 @@ tar -xzf ragflow-prod-v1.0.0.tar.gz && cd ragflow-prod-v1.0.0
 `ParseDefaultModelsConfig` 在開源版是空函式（`internal/server/config/stub.go`，註解寫明 the OSS
 build has none），只有企業版會讀。所以填了也不會生效、不會報錯。
 
-供應商與模型一律在啟動後設定：Web 的「模型供應商」頁，或 REST API（`PUT /api/v1/providers`、
-`POST /api/v1/providers/{provider}/instances`、`.../instances/{instance}/models`，用超級管理員
-登入 `POST /api/v1/auth/login` 拿到的 token）。這些設定存在 MySQL，跟著 volume 保留，換 app image
-不用重設。
+供應商與模型一律在啟動後設定：Web 的「模型供應商」頁，或 REST API。這些設定存在 MySQL，跟著
+volume 保留，換 app image 不用重設。`setup-models.sh` 把 REST API 的步驟串起來。
+
+### 服務帳號、模型與 API key（`setup-models.sh`）
+
+RAGFlow 起來之後，在 `docker/.env` 填兩個值再執行：
+
+```bash
+RAGFLOW_SETUP_EMBEDDING_BASE_URL=http://<embedding 主機>:<埠>/v1   # OpenAI 相容，要含 /v1
+RAGFLOW_SETUP_EMBEDDING_MODEL=<模型名稱>                            # 跟 embedding 服務回報的一致
+```
+```bash
+./setup-models.sh              # 也可以用 --base-url / --model 直接給；--dry-run 只印設定
+```
+
+| 步驟 | API | 已存在時 |
+|---|---|---|
+| 1. 超級管理員登入 Admin | `POST :19381/api/v1/admin/login` | — |
+| 2. 服務帳號（預設 `kb-stack@agentwiki.local`） | `POST /api/v1/auth/login`，不存在就 `POST /api/v1/admin/users` | 密碼跟 `.env` 對不上就用 Admin API 重設成 `.env` 的值 |
+| 3. 供應商 / instance / 模型 | `PUT /api/v1/providers`、`POST .../instances`、`POST .../instances/{i}/models` | 沿用，**不改** instance 的 base URL 與 key |
+| 驗證 | `POST /api/v1/embeddings` 實際算一次向量 | — |
+| 4. 預設 embedding 模型 | `PATCH /api/v1/models/default` | 覆寫 |
+| 5. API key | `POST /api/v1/system/tokens` | 沿用 `.env` 記錄的 `RAGFLOW_KB_API_KEY` |
+| 6. 輸出 | 印出並寫入 `kb-stack.ragflow.env`（600） | — |
+
+- 服務帳號密碼留空時自動產生，與 API key 一起寫回 `docker/.env`（`RAGFLOW_SERVICE_USER_PASSWORD`、
+  `RAGFLOW_KB_API_KEY`），`./gen-env.sh --show` 會列出。Web 也用這個帳號登入。
+- 供應商預設 `OpenAI-API-Compatible`。它底層用 vLLM 的驅動，允許私有網段，所以 embedding 服務在
+  內網 IP 不需要開 `ALLOW_ANY_HOST`。RAGFlow 會在 base URL 後面直接接 `embeddings`，所以要含 `/v1`。
+- kb-stack 的 `RAGFLOW_EMBEDDING_MODEL` 在 1.0 是 **`<模型>@<instance>@<供應商>`**，例如
+  `bge-m3@agentwiki@OpenAI-API-Compatible`（0.x 是 `<模型>@<廠商>`）。腳本會直接印出正確的值。
+- 要換 embedding 服務的位址或 key：instance 已存在時腳本不會改，請到 Web 的模型供應商頁修改，或刪掉
+  instance 後重跑。
+- 需要 `python3`（只用標準函式庫）。
 
 ## 三、跟舊版 RAGFlow 並存
 
@@ -145,7 +180,8 @@ build has none），只有企業版會讀。所以填了也不會生效、不會
 kb-stack 只透過 REST API 使用 RAGFlow。新部署接上前要先完成 kb-stack 的 1.0 相容修改
 （`kb-stack/docs/RAGFLOW_V1_MIGRATION_PLAN.md`），再把 `RAGFLOW_BASE_URL` 指到
 `http://<主機>:19380`（API 埠，或經 nginx 的 18080）、填新的 `RAGFLOW_API_KEY` 與
-`RAGFLOW_EMBEDDING_MODEL`（要先在新 RAGFlow 的模型供應商頁加好 embedding 模型）。
+`RAGFLOW_EMBEDDING_MODEL`。三個值 `setup-models.sh` 都會印出，也寫在部署目錄的
+`kb-stack.ragflow.env`。
 
 這次是**全新安裝**：舊的 0.26.4 保留不動，新的 RAGFlow 與 Cognee 資料庫由 kb-wiki 的附件重新
 解析、切片產生，不做 0.26.4 → 1.0 的資料遷移（那條路要依序經過 v0.27.2 與 v1.0.0-rc1，見
