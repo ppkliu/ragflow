@@ -58,6 +58,11 @@ else
 fi
 # 額外打 latest 標籤，讓手動改 .env 時也有一個固定名字可用
 docker tag "$APP_IMAGE" agentwiki-ragflow:latest
+# repo-deploy.sh build 用：只要本機 image，不打包
+if [ "${BUILD_ONLY:-0}" = "1" ]; then
+  grn "BUILD_ONLY=1：已 build ${APP_IMAGE}，不打包"
+  exit 0
+fi
 
 bold "==> [2/6] 解析相依 image（完整包才會打包）"
 DEP_IMAGES="$(RAGFLOW_IMAGE="$APP_IMAGE" docker compose --project-directory docker \
@@ -76,6 +81,11 @@ else
 fi
 
 bold "==> [3/6] 準備部署檔（stage: ${STAGE}）"
+# 暫存目錄若被拿去當部署目錄（有 docker/.env），刪掉就會連帳密一起丟失，資料將無法連線
+if [ -f "$STAGE/docker/.env" ]; then
+  red "$STAGE 裡有 docker/.env，看起來被當成部署目錄在用。請把部署搬到 dist/ 以外的地方再打包。"
+  exit 1
+fi
 rm -rf "$STAGE"; mkdir -p "$STAGE/docker"
 # 只複製進版控的 docker/ 檔案：執行期資料（docker/data、ragflow-logs…）不能被帶走
 git ls-files -z docker | while IFS= read -r -d '' f; do
