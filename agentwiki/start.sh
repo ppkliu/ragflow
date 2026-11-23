@@ -75,6 +75,66 @@ if [ "$running" -eq 0 ]; then
   fi
 fi
 
+# 網段：Docker 預設網段池（172.17–31.0.0/16、192.168.0.0/16 切 /20）約 31 個網路就用完，之後
+# 建網路會失敗（all predefined address pools have been fully subnetted）。所以 RAGFlow 的網路
+# 自己指定一段 /24，不跟預設池搶：
+#   RAGFLOW_NETWORK_SUBNET=auto（預設，鍵不存在也算）在 172.16.<100-254>.0/24 挑一段跟現有
+#     Docker 網路、主機路由都不重疊的，記在 RAGFLOW_NETWORK_SUBNET_PICKED，之後都沿用同一段
+#     （compose 看到網路設定變了會重建網路，所以不能每次重挑）。172.16.0.0/16 不在 Docker 預設
+#     池裡，也避開公司內網用的 10.x。
+#   RAGFLOW_NETWORK_SUBNET=<CIDR> 指定網段；=none 交給 Docker 預設池（上游原本的行為）。
+want="$(getv RAGFLOW_NETWORK_SUBNET)"; want="${want:-auto}"
+if [ "$want" != "none" ]; then
+  if ! command -v python3 >/dev/null; then
+    ylw "⚠ 沒有 python3，無法挑選網段；網路交給 Docker 預設池"
+  else
+    NET="${PROJECT}_ragflow"
+    # 已存在的網路：沿用它現在的網段，設定不變就不會被 compose 重建
+    existing="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$NET" 2>/dev/null | awk '{print $1}' || true)"
+    if [ -n "$existing" ]; then
+      subnet="$existing"
+    else
+      # 其他 Docker 網路與主機路由佔用的網段（不含自己這個網路，它此時不存在）
+      used="$( { docker network ls -q | xargs -r docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null
+                 ip -4 route 2>/dev/null | awk '$1 ~ /\// {print $1}'; } | tr ' ' '\n' | grep -E '^[0-9]+\.' || true)"
+      if [ "$want" = "auto" ]; then pref="$(getv RAGFLOW_NETWORK_SUBNET_PICKED)"; else pref="$want"; fi
+      subnet="$(USED="$used" PREF="$pref" MODE="$want" python3 - <<'PY'
+import ipaddress, os, sys
+used = [ipaddress.ip_network(s, strict=False) for s in os.environ["USED"].split() if s]
+free = lambda n: not any(n.overlaps(u) for u in used)
+pref = os.environ["PREF"].strip()
+if pref:
+    try:
+        n = ipaddress.ip_network(pref, strict=False)
+    except ValueError:
+        sys.exit(f"RAGFLOW_NETWORK_SUBNET 不是合法網段：{pref}")
+    if free(n):
+        print(n); sys.exit(0)
+    if os.environ["MODE"] != "auto":
+        sys.exit(f"指定的網段 {n} 跟現有 Docker 網路或主機路由重疊，請在 .env 換一段")
+for i in range(100, 255):
+    n = ipaddress.ip_network(f"172.16.{i}.0/24")
+    if free(n):
+        print(n); sys.exit(0)
+sys.exit("172.16.100-254.0/24 都被佔用，請在 .env 用 RAGFLOW_NETWORK_SUBNET 指定一段")
+PY
+)" || { red "挑選網段失敗"; exit 1; }
+      if [ "$want" = "auto" ] && [ "$subnet" != "$(getv RAGFLOW_NETWORK_SUBNET_PICKED)" ]; then
+        if grep -qE '^RAGFLOW_NETWORK_SUBNET_PICKED=' .env; then
+          set_kv RAGFLOW_NETWORK_SUBNET_PICKED "$subnet"
+        else
+          printf '%s=%s\n' RAGFLOW_NETWORK_SUBNET_PICKED "$subnet" >> .env
+        fi
+      fi
+    fi
+    # 覆寫檔每次重寫（部署目錄裡產生的檔案，不進版控、不在部署包裡）
+    printf '# start.sh 產生：RAGFlow 網路的固定網段（見 RAGFLOW_NETWORK_SUBNET）\nnetworks:\n  ragflow:\n    ipam:\n      config:\n        - subnet: %s\n' \
+      "$subnet" > agentwiki-network.override.yml
+    COMPOSE+=(-f agentwiki-network.override.yml)
+    echo "  網路 $NET：$subnet"
+  fi
+fi
+
 bold "==> docker compose up -d（project: $PROJECT）"
 "${COMPOSE[@]}" up -d
 
