@@ -88,8 +88,8 @@ mv "$STAGE/docker/.env" "$STAGE/docker/.env.example"
 echo "RAGFLOW_IMAGE=${APP_IMAGE}" > "$STAGE/image.env"
 # AgentWiki 範本在 repo 裡是 agentwiki/.env.example；包內改名成看得見的 agentwiki.env.example
 cp "$HERE/.env.example" "$STAGE/agentwiki.env.example"
-cp "$HERE/gen-env.sh" "$HERE/start.sh" "$HERE/stop.sh" "$STAGE/"
-chmod +x "$STAGE/gen-env.sh" "$STAGE/start.sh" "$STAGE/stop.sh"
+cp "$HERE/gen-env.sh" "$HERE/setup-models.sh" "$HERE/start.sh" "$HERE/stop.sh" "$STAGE/"
+chmod +x "$STAGE/gen-env.sh" "$STAGE/setup-models.sh" "$STAGE/start.sh" "$STAGE/stop.sh"
 
 bold "==> [4/6] 匯出 image -> images.tar"
 # shellcheck disable=SC2086
@@ -130,7 +130,7 @@ echo "==> 更新部署檔（被覆寫的舊檔備份到 \$BK）"
   mkdir -p "\$DEPLOY_DIR/docker/\$(dirname "\$f")"; cp -p "docker/\$f" "\$DEPLOY_DIR/docker/\$f"
 done
 cp docker/.env.example "\$DEPLOY_DIR/docker/.env.example"
-cp agentwiki.env.example gen-env.sh start.sh stop.sh "\$DEPLOY_DIR/"
+cp agentwiki.env.example gen-env.sh setup-models.sh start.sh stop.sh "\$DEPLOY_DIR/"
 
 echo "==> \$ENV_FILE 的 RAGFLOW_IMAGE -> \$NEWTAG"
 set_kv "\$ENV_FILE" RAGFLOW_IMAGE "\$NEWTAG"
@@ -185,6 +185,7 @@ echo
 echo "下一步："
 echo "  1) 需要的話確認 docker/.env 的埠號（帳密已自動產生，要自訂請在第一次啟動前改）"
 echo "  2) 啟動：./start.sh"
+echo "  3) 在 docker/.env 填 RAGFLOW_SETUP_EMBEDDING_BASE_URL / _MODEL，再跑 ./setup-models.sh"
 LOAD
   chmod +x "$STAGE/load.sh"
 
@@ -203,6 +204,7 @@ LOAD
 | image.env | 本次 app image 標籤（RAGFLOW_IMAGE） |
 | load.sh | 載入 image + 呼叫 gen-env.sh 備妥 \`docker/.env\` |
 | gen-env.sh | 建立 \`docker/.env\` 並自動產生帳密（\`--show\` 查看、\`--dry-run\` 預覽） |
+| setup-models.sh | 啟動後建立服務帳號、embedding 模型供應商與 API key，印出 kb-stack 設定 |
 | start.sh / stop.sh | 啟動（等到 API 健康檢查通過）/ 停止（volume 保留） |
 
 相依 image：
@@ -218,6 +220,7 @@ ${DEP_LIST}
 tar -xzf ${BUNDLE}.tar.gz && cd ${BUNDLE}
 ./load.sh                  # docker load + 產生 docker/.env（帳密自動產生，最後印出管理員帳密）
 ./start.sh                 # 啟動並等待就緒，完成後印出網址
+./setup-models.sh          # 建立服務帳號、embedding 模型與 API key（先在 docker/.env 填 RAGFLOW_SETUP_*）
 ./gen-env.sh --show        # 之後要查帳密
 \`\`\`
 

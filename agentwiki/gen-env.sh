@@ -82,6 +82,8 @@ if [ "$SHOW" = "1" ]; then
   [ -f "$ENV_FILE" ] || { red "找不到 $ENV_FILE"; exit 1; }
   bold "==> $ENV_FILE 的帳密"
   echo "  超級管理員：$(getv DEFAULT_SUPERUSER_EMAIL || true) / $(getv DEFAULT_SUPERUSER_PASSWORD || true)"
+  echo "  服務帳號（Web 登入、kb-stack）：$(getv RAGFLOW_SERVICE_USER_EMAIL || true) / $(getv RAGFLOW_SERVICE_USER_PASSWORD || true)"
+  echo "  kb-stack API key：$(getv RAGFLOW_KB_API_KEY || true)"
   for k in ELASTIC_PASSWORD MYSQL_PASSWORD MINIO_USER MINIO_PASSWORD REDIS_PASSWORD; do
     echo "  $k=$(getv "$k" || true)"
   done
@@ -173,7 +175,7 @@ fi
 chmod 600 "$ENV_FILE"
 
 echo
-bold "超級管理員（第一次啟動時建立；登入 Web 後到頭像 → API 產生 kb-stack 用的 API key）"
+bold "超級管理員（第一次啟動時建立；只能登入 Admin，Web 與 API key 用 ./setup-models.sh 建的服務帳號）"
 echo "  帳號：$(getv DEFAULT_SUPERUSER_EMAIL)"
 echo "  密碼：$(getv DEFAULT_SUPERUSER_PASSWORD)"
 echo "  其他帳密都在 $ENV_FILE（權限 600），之後可用 ./gen-env.sh --show 查看。"
