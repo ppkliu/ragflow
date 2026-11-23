@@ -23,7 +23,7 @@
                               ▼
 ══════════════ 目標機（離線，Docker + Compose v2）══════════════
  ./load-select.sh <dir>   或手動：
-   完整包 ─▶ tar -xzf → ./load.sh → 編輯 docker/.env → ./start.sh
+   完整包 ─▶ tar -xzf → ./load.sh（自動產生 docker/.env 與帳密）→ ./start.sh
    更新包 ─▶ tar -xzf → ./update.sh <既有部署目錄>
 ```
 
@@ -31,7 +31,8 @@
 |---|---|---|
 | `agentwiki/pack-prod.sh` | 建置機 | 打包完整包 / 更新包（`APP_ONLY=1`） |
 | `agentwiki/load-select.sh` | 目標機 | 掃描 / 選擇 / 確認 / 載入 tar.gz（打包時會複製到 `dist/`） |
-| `load.sh`（包內生成） | 目標機 | 完整包：`docker load` + 產生 `docker/.env` |
+| `load.sh`（包內生成） | 目標機 | 完整包：`docker load` + 呼叫 gen-env.sh |
+| `agentwiki/gen-env.sh` | 目標機 | 建立 `docker/.env`（官方範本 + `agentwiki/.env.example`）並自動產生帳密 |
 | `update.sh`（包內生成） | 目標機 | 更新包：換 app image，資料保留 |
 | `start.sh` / `stop.sh` | 目標機 | 啟動並等到健康檢查通過 / 停止（volume 保留） |
 
@@ -70,25 +71,57 @@ RAGFLOW_IMAGE=myrepo/ragflow:rc1 agentwiki/pack-prod.sh
 ```bash
 sha256sum -c ragflow-prod-v1.0.0.tar.gz.sha256
 tar -xzf ragflow-prod-v1.0.0.tar.gz && cd ragflow-prod-v1.0.0
-./load.sh                  # docker load + 產生 docker/.env（第一次會套用 agentwiki.env）
-nano docker/.env           # 改掉預設密碼；確認埠號
+./load.sh                  # docker load + gen-env.sh：建立 docker/.env、自動產生帳密
 ./start.sh                 # 啟動，等到 /api/v1/system/healthz 通過
+./gen-env.sh --show        # 之後要查帳密
 ```
 
-- **預設密碼要在第一次啟動前改。** `ELASTIC_PASSWORD`、`MYSQL_PASSWORD`、`MINIO_PASSWORD`、
-  `REDIS_PASSWORD` 的官方預設值是 `infini_rag_flow`，load.sh 會列出還沒改的。這些密碼只在資料
-  初始化時生效，之後再改只會造成連線失敗。
+### docker/.env 與帳密自動產生（`gen-env.sh`）
+
+`docker/.env` 由三層組成：官方範本 `docker/.env.example` → AgentWiki 範本
+`agentwiki.env.example`（repo 裡是 `agentwiki/.env.example`：project 名稱、埠號、帳密欄位）→
+`gen-env.sh` 產生的帳密。load.sh 會自動呼叫 gen-env.sh，參數原樣轉過去。
+
+| 用法 | 做什麼 |
+|---|---|
+| `./load.sh` 或 `./gen-env.sh` | `.env` 不存在就建立；空值或公開預設值（`infini_rag_flow`、`admin`）的帳密換成 24 字元隨機英數字；已設定的值不動，重跑不會變 |
+| `--admin-email you@example.com` | 指定第一個超級管理員的 email（預設 `admin@ragflow.io`） |
+| `--dry-run` | 只列出會改哪些鍵 |
+| `--rotate` | 所有帳密重新產生（只在還沒有資料時允許） |
+| `--show` | 印出目前的帳密 |
+
+產生的帳密：`ELASTIC_PASSWORD`、`MYSQL_PASSWORD`、`MINIO_PASSWORD`、`REDIS_PASSWORD`、
+`DEFAULT_SUPERUSER_PASSWORD`（舊名 `ADMIN_DEFAULT_PASSWORD` 寫成同一個值）。要用自己指定的值，
+在 load.sh 之前填進 `agentwiki.env.example`，或之後直接改 `docker/.env`，gen-env.sh 不會覆寫有值的鍵。
+只用英數字，是因為這些值會經過 compose 變數替換、YAML 與連線字串，特殊字元在這幾處的轉義規則各不相同。
+
+- **帳密只在第一次啟動、資料初始化時生效。** 之後再改只會讓服務連不上自己的資料。gen-env.sh
+  偵測到這個 compose project 已經有 volume 時，任何帳密都不會改，只列出仍是預設值的鍵。
+- 改帳密前會把原本的 `.env` 備份成 `.env.bak-<時間>`；`.env` 與備份的權限都是 600。
+- 在 repo 原始碼目錄執行會被擋下：那裡的 `docker/.env` 是上游進版控的範本，不是部署用的。
 - **`vm.max_map_count` 至少 262144**，Elasticsearch 才起得來。start.sh 會檢查並印出修正指令。
-- 第一次啟動用 `--init-superuser` 建立管理員（官方 compose 的預設），登入 Web 後到右上角頭像
-  → API 產生 API key，填進 kb-stack 的 `RAGFLOW_API_KEY`。
+- 第一次啟動時（官方 compose 帶 `--init-superuser`）用上面的 email 與密碼建立超級管理員。登入 Web
+  後到右上角頭像 → API 產生 API key，填進 kb-stack 的 `RAGFLOW_API_KEY`。
+
+### 模型供應商不能從 .env 設定
+
+1.0 開源版**沒有**從設定檔帶入模型供應商的功能。`docker/service_conf.yaml.template` 裡雖然還有
+`user_default_llm`（0.x 時代可以寫 factory、api_key、base_url），但 1.0 的 Go 後端讀它的
+`ParseDefaultModelsConfig` 在開源版是空函式（`internal/server/config/stub.go`，註解寫明 the OSS
+build has none），只有企業版會讀。所以填了也不會生效、不會報錯。
+
+供應商與模型一律在啟動後設定：Web 的「模型供應商」頁，或 REST API（`PUT /api/v1/providers`、
+`POST /api/v1/providers/{provider}/instances`、`.../instances/{instance}/models`，用超級管理員
+登入 `POST /api/v1/auth/login` 拿到的 token）。這些設定存在 MySQL，跟著 volume 保留，換 app image
+不用重設。
 
 ## 三、跟舊版 RAGFlow 並存
 
 1.0 的 compose 沒有寫死 `container_name`，所以容器、volume、network 都跟著 compose project
-名稱走。`agentwiki.env` 把 project 設成 `ragflow-v100`，舊版官方部署通常是 `docker`，兩者互不
-相干。
+名稱走。`agentwiki/.env.example` 把 project 設成 `ragflow-v100`，舊版官方部署通常是 `docker`，
+兩者互不相干。
 
-會撞的只有 host 埠號，`agentwiki.env` 全部改開：
+會撞的只有 host 埠號，`agentwiki/.env.example` 全部改開：
 
 | 用途 | 變數 | 官方預設 | 這裡 |
 |---|---|---|---|
@@ -105,7 +138,7 @@ nano docker/.env           # 改掉預設密碼；確認埠號
 寫死 `minio:9000`、`es01:9200`；Kvrocks 在 `ragflow-cpu` 的 environment 另外固定成 6379），改了
 不影響內部連線。start.sh 啟動前會檢查這些埠號有沒有被佔用。
 
-主機上沒有舊版、想用官方埠號時，在 `load.sh` 之前把 `agentwiki.env` 的對應行刪掉即可。
+主機上沒有舊版、想用官方埠號時，在 `load.sh` 之前把包內 `agentwiki.env.example` 的對應行刪掉即可。
 
 ## 四、kb-stack 要怎麼接
 
