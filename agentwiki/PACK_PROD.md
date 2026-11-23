@@ -230,6 +230,14 @@ agentwiki/repo-deploy.sh status | logs [服務] | down
 寫回 `.env`（原檔先備份成 `.bak-<時間>`，symlink 與 600 權限保留），再啟動。API 埠變了會提醒 kb-stack
 的 `RAGFLOW_BASE_URL` 要跟著改，`setup-models.sh` 印出的是新值。要改回「只報錯停下」：`AUTO_PORTS=0 ./start.sh`。
 
+**網段也自己指定，不跟 Docker 預設網段池搶。** Docker 預設池（172.17–31.0.0/16、192.168.0.0/16 切 /20）
+約 31 個網路就用完，再建網路會失敗：`all predefined address pools have been fully subnetted`。共用的
+測試機上很容易碰到。`RAGFLOW_NETWORK_SUBNET`（預設 `auto`）讓 start.sh 在 `172.16.100-254.0/24`
+挑一段跟現有 Docker 網路與主機路由都不重疊的，記在 `RAGFLOW_NETWORK_SUBNET_PICKED`，用產生的
+`docker/agentwiki-network.override.yml` 交給 compose。之後每次都沿用同一段：compose 看到網路設定變了會
+重建網路。172.16.0.0/16 不在 Docker 預設池裡，也避開公司內網的 10.x。可以填固定網段，或 `none`
+回到 Docker 預設池。網路已經存在時沿用它現有的網段。
+
 主機上沒有舊版、想用官方埠號時，在 `load.sh` 之前把包內 `agentwiki.env.example` 的對應行刪掉即可。
 
 ## 四、kb-stack 要怎麼接
