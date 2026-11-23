@@ -223,7 +223,12 @@ agentwiki/repo-deploy.sh status | logs [服務] | down
 
 這些變數都只用在 host 端：容器之間一律用服務名稱加容器內固定埠號連線（`service_conf.yaml.template`
 寫死 `minio:9000`、`es01:9200`；Kvrocks 在 `ragflow-cpu` 的 environment 另外固定成 6379），改了
-不影響內部連線。start.sh 啟動前會檢查這些埠號有沒有被佔用。
+不影響內部連線。
+
+**埠號被佔用時 start.sh 會自動避開。** 這個 project 沒有容器在跑時，start.sh 逐一檢查上表的埠號；被其他
+程式（例如同一台上的舊版 RAGFlow）佔用的，往上找第一個沒人在聽、也沒被同一份 `.env` 其他鍵用掉的埠，
+寫回 `.env`（原檔先備份成 `.bak-<時間>`，symlink 與 600 權限保留），再啟動。API 埠變了會提醒 kb-stack
+的 `RAGFLOW_BASE_URL` 要跟著改，`setup-models.sh` 印出的是新值。要改回「只報錯停下」：`AUTO_PORTS=0 ./start.sh`。
 
 主機上沒有舊版、想用官方埠號時，在 `load.sh` 之前把包內 `agentwiki.env.example` 的對應行刪掉即可。
 
