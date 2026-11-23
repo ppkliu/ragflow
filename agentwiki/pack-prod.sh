@@ -86,17 +86,20 @@ done
 # 官方 docker/.env 是帶預設密碼的範本；包內改名成 .env.example，真正的 .env 在目標機產生
 mv "$STAGE/docker/.env" "$STAGE/docker/.env.example"
 echo "RAGFLOW_IMAGE=${APP_IMAGE}" > "$STAGE/image.env"
-cp "$HERE/agentwiki.env" "$HERE/start.sh" "$HERE/stop.sh" "$STAGE/"
-chmod +x "$STAGE/start.sh" "$STAGE/stop.sh"
+# AgentWiki 範本在 repo 裡是 agentwiki/.env.example；包內改名成看得見的 agentwiki.env.example
+cp "$HERE/.env.example" "$STAGE/agentwiki.env.example"
+cp "$HERE/gen-env.sh" "$HERE/start.sh" "$HERE/stop.sh" "$STAGE/"
+chmod +x "$STAGE/gen-env.sh" "$STAGE/start.sh" "$STAGE/stop.sh"
 
 bold "==> [4/6] 匯出 image -> images.tar"
 # shellcheck disable=SC2086
 docker save $SAVE_IMAGES -o "$STAGE/images.tar"
 
 bold "==> [5/6] 產生部署端腳本與說明"
-# 兩種包共用：把 KEY=VAL 寫進 .env（有就取代、沒有就附加；值原樣寫入，不經 sed 解讀）
+# 兩種包共用：把 KEY=VAL 寫進 .env（有就取代、沒有就附加；值原樣寫入，不經 sed 解讀）。
+# 用 cat 覆寫而不是 mv：保留 .env 的 600 權限（裡面有帳密）
 SETKV='set_kv(){ local f="$1" k="$2" v="$3"; if grep -qE "^${k}=" "$f"; then
-  awk -v k="$k" -v v="$v" -F= '"'"'BEGIN{OFS="="} $1==k{print k"="v; next} {print}'"'"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  awk -v k="$k" -v v="$v" -F= '"'"'BEGIN{OFS="="} $1==k{print k"="v; next} {print}'"'"' "$f" > "$f.tmp" && cat "$f.tmp" > "$f" && rm -f "$f.tmp"
   else printf "%s=%s\n" "$k" "$v" >> "$f"; fi; }'
 
 if [ "$APP_ONLY" = "1" ]; then
@@ -127,7 +130,7 @@ echo "==> 更新部署檔（被覆寫的舊檔備份到 \$BK）"
   mkdir -p "\$DEPLOY_DIR/docker/\$(dirname "\$f")"; cp -p "docker/\$f" "\$DEPLOY_DIR/docker/\$f"
 done
 cp docker/.env.example "\$DEPLOY_DIR/docker/.env.example"
-cp start.sh stop.sh "\$DEPLOY_DIR/"
+cp agentwiki.env.example gen-env.sh start.sh stop.sh "\$DEPLOY_DIR/"
 
 echo "==> \$ENV_FILE 的 RAGFLOW_IMAGE -> \$NEWTAG"
 set_kv "\$ENV_FILE" RAGFLOW_IMAGE "\$NEWTAG"
@@ -171,28 +174,16 @@ ${SETKV}
 echo "==> docker load images.tar"
 docker load -i images.tar
 
+# 建立 docker/.env（官方範本 + agentwiki.env.example）並自動產生帳密；參數原樣轉給 gen-env.sh，
+# 例如 ./load.sh --admin-email ops@example.com
+./gen-env.sh "\$@"
 ENV_FILE=docker/.env
-if [ ! -f "\$ENV_FILE" ]; then
-  cp docker/.env.example "\$ENV_FILE"
-  # 第一次才套用 agentwiki.env（並存用的 project 名稱與埠號）；之後以 docker/.env 為準
-  while IFS='=' read -r k v; do
-    case "\$k" in ''|\#*) continue;; esac
-    set_kv "\$ENV_FILE" "\$k" "\$v"
-  done < agentwiki.env
-  echo "==> 已建立 \$ENV_FILE（套用 agentwiki.env）"
-fi
 NEWTAG=\$(grep '^RAGFLOW_IMAGE=' image.env | cut -d= -f2-)
 set_kv "\$ENV_FILE" RAGFLOW_IMAGE "\$NEWTAG"
 
-weak=\$(grep -E '^(ELASTIC_PASSWORD|MYSQL_PASSWORD|MINIO_PASSWORD|REDIS_PASSWORD)=infini_rag_flow\$' "\$ENV_FILE" | cut -d= -f1 | tr '\n' ' ')
 echo
 echo "下一步："
-if [ -n "\$weak" ]; then
-  echo "  1) 編輯 docker/.env，改掉仍是官方預設值的密碼：\$weak"
-  echo "     ★ 密碼只在第一次啟動、資料初始化時生效，之後再改只會造成連線失敗"
-else
-  echo "  1) 確認 docker/.env（project 名稱、埠號、密碼）"
-fi
+echo "  1) 需要的話確認 docker/.env 的埠號（帳密已自動產生，要自訂請在第一次啟動前改）"
 echo "  2) 啟動：./start.sh"
 LOAD
   chmod +x "$STAGE/load.sh"
@@ -208,9 +199,10 @@ LOAD
 |---|---|
 | images.tar | app（${APP_IMAGE}）+ 相依 image（清單見下） |
 | docker/ | 官方 compose、設定範本（\`.env.example\`）、entrypoint 等部署檔 |
-| agentwiki.env | 第一次建立 \`docker/.env\` 時套用：compose project 名稱與 host 埠號 |
+| agentwiki.env.example | 建立 \`docker/.env\` 時套用：compose project 名稱、host 埠號、帳密欄位 |
 | image.env | 本次 app image 標籤（RAGFLOW_IMAGE） |
-| load.sh | 載入 image + 備妥 \`docker/.env\` |
+| load.sh | 載入 image + 呼叫 gen-env.sh 備妥 \`docker/.env\` |
+| gen-env.sh | 建立 \`docker/.env\` 並自動產生帳密（\`--show\` 查看、\`--dry-run\` 預覽） |
 | start.sh / stop.sh | 啟動（等到 API 健康檢查通過）/ 停止（volume 保留） |
 
 相依 image：
@@ -224,15 +216,18 @@ ${DEP_LIST}
 ## 步驟
 \`\`\`bash
 tar -xzf ${BUNDLE}.tar.gz && cd ${BUNDLE}
-./load.sh                  # docker load + 產生 docker/.env
-nano docker/.env           # 改密碼；確認埠號
+./load.sh                  # docker load + 產生 docker/.env（帳密自動產生，最後印出管理員帳密）
 ./start.sh                 # 啟動並等待就緒，完成後印出網址
+./gen-env.sh --show        # 之後要查帳密
 \`\`\`
+
+管理員 email 要自訂就在 load.sh 加 \`--admin-email you@example.com\`。所有帳密只在第一次啟動時
+生效；已有資料後 gen-env.sh 不會再改任何帳密。
 
 ## 跟舊版 RAGFlow 並存
 預設 compose project 是 \`ragflow-v100\`，容器、volume、network 都帶這個前綴，不會碰到舊版
 （舊版官方部署的 project 通常是 \`docker\`）。host 埠號預設改成 18080（Web）/ 19380（API）等，
-見 \`agentwiki.env\`；start.sh 會先檢查埠號有沒有被佔用。
+見 \`agentwiki.env.example\`；start.sh 會先檢查埠號有沒有被佔用。
 
 ## 驗證
 \`\`\`bash
