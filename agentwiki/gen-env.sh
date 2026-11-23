@@ -13,6 +13,13 @@
 #   ./gen-env.sh --rotate            # 全部帳密重新產生（只在還沒有任何資料時允許）
 #   ./gen-env.sh --show              # 印出 docker/.env 目前的帳密
 #   ./gen-env.sh --dir <部署目錄>    # 不在部署目錄執行時指定
+#   ./gen-env.sh --env-store <檔案>  # 真正的 .env 存放位置（預設見下）
+#   ./gen-env.sh --no-env-store      # .env 就放在 docker/ 底下，不另外存放
+#
+# .env 集中存放：主機上有 /opt/AgentWiki 時，真正的 .env 放在 /opt/AgentWiki/shared/env/ragflow.env
+# （跟 adapter.env、kb-stack.env 同一處，換版不動），docker/.env 只是指向它的 symlink。部署目錄或
+# repo 的 runtime/ 整個被刪掉，帳密也還在；部署包與 repo-deploy.sh 兩種模式自動共用同一份。
+# 也可用環境變數 RAGFLOW_ENV_STORE 指定（設成 none 等同 --no-env-store）。
 #
 # ★ 這些密碼只在第一次啟動、資料初始化時生效。偵測到這個 compose project 已經有 volume
 #   時，任何帳密都不會被改（改了只會讓服務連不上自己的資料）。
@@ -25,6 +32,8 @@ red(){ printf '\033[31m%s\033[0m\n' "$*" >&2; }
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 DRY=0; ROTATE=0; SHOW=0; ADMIN_EMAIL=""
+STORE="${RAGFLOW_ENV_STORE:-}"
+if [ -z "$STORE" ] && [ -d /opt/AgentWiki ]; then STORE=/opt/AgentWiki/shared/env/ragflow.env; fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
@@ -32,7 +41,9 @@ while [ $# -gt 0 ]; do
     --show) SHOW=1 ;;
     --admin-email) ADMIN_EMAIL="${2:?--admin-email 需要一個值}"; shift ;;
     --dir) DIR="$(cd "${2:?--dir 需要一個目錄}" && pwd)"; shift ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --env-store) STORE="${2:?--env-store 需要檔案路徑}"; shift ;;
+    --no-env-store) STORE=none ;;
+    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) red "不認得的參數：$1（--help 看用法）"; exit 2 ;;
   esac
   shift
@@ -90,6 +101,52 @@ if [ "$SHOW" = "1" ]; then
   exit 0
 fi
 
+# ---- 0) .env 集中存放：docker/.env 是指向 STORE 的 symlink ----
+[ "$STORE" = "none" ] && STORE=""
+link_store(){ ln -sfn "$STORE" "$ENV_FILE"; echo "  docker/.env → $STORE"; }
+if [ -n "$STORE" ] && [ "$SHOW" = "0" ]; then
+  case "$STORE" in /*) ;; *) red "--env-store 要用絕對路徑：$STORE"; exit 2 ;; esac
+  if [ "$DRY" = "1" ]; then
+    echo "[dry-run] .env 會集中存放在 $STORE，docker/.env 改成指向它的 symlink"
+  else
+    if ! mkdir -p "$(dirname "$STORE")" 2>/dev/null || [ ! -w "$(dirname "$STORE")" ]; then
+      red "沒有權限寫 $(dirname "$STORE")。先執行："
+      red "  sudo mkdir -p $(dirname "$STORE") && sudo chown \$(id -un): $(dirname "$STORE")"
+      red "或用 --no-env-store 把 .env 留在 docker/ 底下。"
+      exit 1
+    fi
+    if [ -L "$ENV_FILE" ]; then
+      cur="$(readlink "$ENV_FILE")"
+      if [ "$cur" != "$STORE" ]; then
+        if [ -f "$STORE" ]; then
+          ylw "⚠ docker/.env 指向 $cur，不是 $STORE；改指向 $STORE（原連結目標不動）"
+          link_store
+        elif [ -f "$cur" ]; then
+          cp -p "$cur" "$STORE"; chmod 600 "$STORE"; link_store
+          grn "==> 已把 $cur 複製到 $STORE（原檔不動）"
+        fi
+      fi
+    elif [ -f "$ENV_FILE" ]; then
+      # 既有的一般檔：搬到集中位置。集中位置已有內容不同的 .env 時不擅自取捨
+      if [ -f "$STORE" ] && ! cmp -s "$ENV_FILE" "$STORE"; then
+        red "$ENV_FILE 與 $STORE 都存在且內容不同，不知道該用哪一份。"
+        red "  兩份是同一個 compose project 的話，帳密以資料初始化時的那份為準；確認後把另一份移走再重跑。"
+        exit 1
+      fi
+      if [ -f "$STORE" ]; then
+        mv "$ENV_FILE" "$ENV_FILE.migrated-$(date +%Y%m%d-%H%M%S)"
+      else
+        mv "$ENV_FILE" "$STORE"; chmod 600 "$STORE"
+      fi
+      link_store
+      grn "==> 已把 docker/.env 搬到 $STORE"
+    elif [ -f "$STORE" ]; then
+      link_store
+      grn "==> 沿用集中存放的 $STORE（帳密不變）"
+    fi
+  fi
+fi
+
 # ---- 1) 建立 docker/.env ----
 CREATED=0
 if [ ! -f "$ENV_FILE" ]; then
@@ -98,7 +155,11 @@ if [ ! -f "$ENV_FILE" ]; then
   if [ "$DRY" = "1" ]; then
     echo "[dry-run] 會以 docker/.env.example 為底、套上 $(basename "$OVERLAY") 建立 $ENV_FILE"
   else
-    cp "$BASE_TEMPLATE" "$ENV_FILE"
+    if [ -n "$STORE" ]; then
+      cp "$BASE_TEMPLATE" "$STORE"; chmod 600 "$STORE"; link_store
+    else
+      cp "$BASE_TEMPLATE" "$ENV_FILE"
+    fi
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in ''|\#*) continue ;; esac
       k="${line%%=*}"; v="${line#*=}"
@@ -161,7 +222,8 @@ else
     exit 0
   fi
   if [ "$CREATED" = "0" ]; then
-    bk="$ENV_FILE.bak-$(date +%Y%m%d-%H%M%S)"
+    # 備份放在真正的檔案旁邊（集中存放時是 shared/env/），不是 symlink 所在的部署目錄
+    bk="$(readlink -f "$ENV_FILE").bak-$(date +%Y%m%d-%H%M%S)"
     cp -p "$ENV_FILE" "$bk"; chmod 600 "$bk"
     echo "==> 修改前的 .env 備份在 $bk"
   fi
@@ -178,4 +240,4 @@ echo
 bold "超級管理員（第一次啟動時建立；只能登入 Admin，Web 與 API key 用 ./setup-models.sh 建的服務帳號）"
 echo "  帳號：$(getv DEFAULT_SUPERUSER_EMAIL)"
 echo "  密碼：$(getv DEFAULT_SUPERUSER_PASSWORD)"
-echo "  其他帳密都在 $ENV_FILE（權限 600），之後可用 ./gen-env.sh --show 查看。"
+echo "  其他帳密都在 $(readlink -f "$ENV_FILE")（權限 600），之後可用 ./gen-env.sh --show 查看。"

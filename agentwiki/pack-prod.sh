@@ -80,6 +80,9 @@ else
   SAVE_IMAGES="$SAVE_IMAGES $DEP_IMAGES"
 fi
 
+mkdir -p "$OUT_DIR"
+# 打包產物（數 GB 的 tar.gz、bundle）不進版控：不依賴上游 .gitignore 剛好有 dist 這一條
+[ -f "$OUT_DIR/.gitignore" ] || printf '# pack-prod.sh 的輸出目錄：打包產物不進版控\n*\n' > "$OUT_DIR/.gitignore"
 bold "==> [3/6] 準備部署檔（stage: ${STAGE}）"
 # 暫存目錄若被拿去當部署目錄（有 docker/.env），刪掉就會連帳密一起丟失，資料將無法連線
 if [ -f "$STAGE/docker/.env" ]; then
