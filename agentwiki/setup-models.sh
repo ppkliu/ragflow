@@ -246,8 +246,20 @@ try:
         else:
             call("POST", f"{api}/providers/{prov}/instances/{inst}/models", model_info, token=user_token)
             print(f"  已加入模型「{cfg['model']}」")
-        warn("  instance 已存在時不會改它的 base URL / API key；要改請到 Web 的模型供應商頁，"
-             "或刪掉 instance 後重跑。")
+        # 這個 instance 是腳本管的：base URL 以 .env 為準，不一致就改。PUT 會把 model_info 當成完整
+        # 清單（沒列到的模型會被刪），所以把現有模型全部帶上（只給名稱，不改它們的設定）。
+        # API key 只在 .env 有填時才送；留空 = 沿用 instance 現有的 key。
+        cur = call("GET", f"{api}/providers/{prov}/instances/{inst}", token=user_token) or {}
+        cur_url = (cur.get("base_url") or "") if isinstance(cur, dict) else ""
+        if cur_url.rstrip("/") != cfg["base_url"].rstrip("/") or cfg["api_key"]:
+            keep = [{"model_name": m["name"]} for m in models
+                    if m.get("name") and m.get("name") != cfg["model"]]
+            body = {"base_url": cfg["base_url"], "model_info": keep + [model_info]}
+            if cfg["api_key"]:
+                body["api_key"] = cfg["api_key"]
+            call("PUT", f"{api}/providers/{prov}/instances/{inst}", body, token=user_token)
+            if cur_url.rstrip("/") != cfg["base_url"].rstrip("/"):
+                warn(f"  base URL 已從 {cur_url or '（空）'} 改成 {cfg['base_url']}")
     else:
         call("POST", f"{api}/providers/{prov}/instances",
              {"instance_name": cfg["instance"], "api_key": cfg["api_key"], "base_url": cfg["base_url"],
