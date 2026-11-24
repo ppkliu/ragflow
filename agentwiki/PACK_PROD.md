@@ -273,6 +273,29 @@ kb-stack 只透過 REST API 使用 RAGFlow。新部署接上前要先完成 kb-s
 解析、切片產生，不做 0.26.4 → 1.0 的資料遷移（那條路要依序經過 v0.27.2 與 v1.0.0-rc1，見
 `kb-stack/docs/RAGFLOW_UPGRADE_ANALYSIS.md` 第五節）。
 
+## 四之一、效能比較（`bench.py`）
+
+同一批檔案依序丟給每個 RAGFlow（一次只跑一個），量上傳、解析牆鐘時間、每份文件的伺服器解析時間、
+chunks 數與檢索延遲，期間用 `docker stats` 記錄該 compose project 每個容器的 CPU 與記憶體，最後輸出
+比較報表。0.x 與 1.0 的 API 差異沿用 kb-stack 連接器的處理方式。只用 Python 標準函式庫，在主機上執行
+（要能跑 docker 指令）。
+
+```bash
+export K100=$(grep -E '^RAGFLOW_KB_API_KEY=' /opt/AgentWiki/shared/env/ragflow.env | cut -d= -f2-)
+export K024=<0.24 Web → 個人設定 → API 建的 key>
+agentwiki/bench.py --files ~/bench-files \
+  --target v100 http://127.0.0.1:<1.0 API 埠> env:K100 ragflow-v100 \
+  --target v024 http://127.0.0.1:<0.24 API 埠> env:K024 ragflow_docker \
+  --question "跟測試檔內容有關的問題"
+```
+
+- `--target 名稱 base_url key compose_project [embedding]`；key 寫成 `env:變數名` 從環境變數讀，不會留在
+  `ps` 與 shell history。
+- 輸出在 `~/ragflow-bench/<時間>/`：`report.md`（比較報表）、`result.json`、`samples.csv`（資源取樣）。
+- 每個 target 建一個暫用 dataset `kbbench_<名稱>_<時間>`，跑完刪除（`--keep` 保留）。
+- 計時用單調時鐘，主機校時（WSL 常見）不會讓耗時失真。
+- 兩邊的解析器、並行 worker 數與 embedding 模型不同時，比的是「整套預設行為」。
+
 ## 五、注意事項
 
 - **build runner 缺 native library（2026-11-19 實際踩到）。** 官方 Dockerfile 的 go-builder 階段
