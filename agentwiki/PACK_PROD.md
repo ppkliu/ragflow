@@ -149,7 +149,7 @@ RAGFLOW_SETUP_EMBEDDING_MODEL=<模型名稱>                            # 跟 em
 |---|---|---|
 | 1. 超級管理員登入 Admin | `POST :19381/api/v1/admin/login` | — |
 | 2. 服務帳號（預設 `kb-stack@agentwiki.local`） | `POST /api/v1/auth/login`，不存在就 `POST /api/v1/admin/users` | 密碼跟 `.env` 對不上就用 Admin API 重設成 `.env` 的值 |
-| 3. 供應商 / instance / 模型 | `PUT /api/v1/providers`、`POST .../instances`、`POST .../instances/{i}/models` | 沿用，**不改** instance 的 base URL 與 key |
+| 3. 供應商 / instance / 模型 | `PUT /api/v1/providers`、`POST .../instances`、`POST .../instances/{i}/models` | 沿用；base URL 跟 `.env` 不一致就用 `PUT .../instances/{i}` 改成 `.env` 的值（`.env` 有填 key 時一併更新），其他模型保留 |
 | 驗證 | `POST /api/v1/providers/{p}/connection`（Web「測試連線」同一支）：RAGFlow 容器實際打一次 embedding 服務 | — |
 | 4. 預設 embedding 模型 | `PATCH /api/v1/models/default` | 覆寫 |
 | 5. API key | `POST /api/v1/system/tokens` | 沿用 `.env` 記錄的 `RAGFLOW_KB_API_KEY` |
