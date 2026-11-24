@@ -39,7 +39,7 @@ for a in "$@"; do
 done
 command -v python3 >/dev/null 2>&1 || { echo "需要 python3（只用標準函式庫）" >&2; exit 1; }
 exec python3 - "$DIR" "$@" <<'PY'
-import argparse, json, os, secrets, string, sys, time
+import argparse, base64, json, os, secrets, string, sys, time
 import urllib.error, urllib.request
 
 deploy_dir = sys.argv[1]
@@ -170,6 +170,12 @@ def call(method, url, body=None, token=None, want_header=False, timeout=60):
 
 def step(n, s): bold(f"==> [{n}/6] {s}")
 
+# 密碼一律送 base64(明文)：RAGFlow 存的是 hash(base64(明文))（Web 前端送 RSA(base64(明文))，
+# 第一個超級管理員也是這樣建的）。伺服器解不開 RSA 時會原樣使用收到的字串，所以送 base64
+# 等同前端解密後的值；送明文會被當成另一個密碼，登入得到 code 109 do not match。
+# 建帳號、改密碼也要送同樣的格式，否則建出來的帳號 Web 登不進去。
+def wire_pw(p): return base64.b64encode(p.encode()).decode()
+
 # ---- 等 API 就緒 ----
 deadline = time.time() + args.wait
 while True:
@@ -184,7 +190,7 @@ try:
     # ---- 1) 超級管理員登入 Admin API ----
     step(1, "超級管理員登入 Admin API")
     _, admin_token = call("POST", f"{admin_api}/login",
-                          {"email": admin_email, "password": admin_password}, want_header=True)
+                          {"email": admin_email, "password": wire_pw(admin_password)}, want_header=True)
     if not admin_token:
         die("Admin 登入成功但沒有回傳 Authorization header")
     ok("  ok")
@@ -200,7 +206,7 @@ try:
 
     def user_login():
         _, tok = call("POST", f"{api}/auth/login",
-                      {"email": cfg["user_email"], "password": cfg["user_password"]}, want_header=True)
+                      {"email": cfg["user_email"], "password": wire_pw(cfg["user_password"])}, want_header=True)
         return tok
 
     try:
@@ -210,13 +216,13 @@ try:
         msg = str(e)
         if "not registered" in msg:
             call("POST", f"{admin_api}/users",
-                 {"username": cfg["user_email"], "password": cfg["user_password"], "role": "user"},
+                 {"username": cfg["user_email"], "password": wire_pw(cfg["user_password"]), "role": "user"},
                  token=admin_token)
             print("  已建立")
         elif "do not match" in msg:
             # 帳號是這支腳本管的：密碼跟 docker/.env 對不上，就以 .env 為準重設
             call("PUT", f"{admin_api}/users/{urllib.request.quote(cfg['user_email'])}/password",
-                 {"new_password": cfg["user_password"]}, token=admin_token)
+                 {"new_password": wire_pw(cfg["user_password"])}, token=admin_token)
             warn("  密碼與 docker/.env 不一致，已用 Admin API 重設成 .env 的值")
         else:
             raise
