@@ -150,11 +150,16 @@ RAGFLOW_SETUP_EMBEDDING_MODEL=<模型名稱>                            # 跟 em
 | 1. 超級管理員登入 Admin | `POST :19381/api/v1/admin/login` | — |
 | 2. 服務帳號（預設 `kb-stack@agentwiki.local`） | `POST /api/v1/auth/login`，不存在就 `POST /api/v1/admin/users` | 密碼跟 `.env` 對不上就用 Admin API 重設成 `.env` 的值 |
 | 3. 供應商 / instance / 模型 | `PUT /api/v1/providers`、`POST .../instances`、`POST .../instances/{i}/models` | 沿用，**不改** instance 的 base URL 與 key |
-| 驗證 | `POST /api/v1/embeddings` 實際算一次向量 | — |
+| 驗證 | `POST /api/v1/providers/{p}/connection`（Web「測試連線」同一支）：RAGFlow 容器實際打一次 embedding 服務 | — |
 | 4. 預設 embedding 模型 | `PATCH /api/v1/models/default` | 覆寫 |
 | 5. API key | `POST /api/v1/system/tokens` | 沿用 `.env` 記錄的 `RAGFLOW_KB_API_KEY` |
 | 6. 輸出 | 印出並寫入 `kb-stack.ragflow.env`（600） | — |
 
+- 驗證不用 `POST /api/v1/embeddings`：它要求請求帶 `dimension`、模型登記 `max_dimension` 與
+  `max_batch_size`，否則回 `input dimension <= 0`；帶了 `dimension` 又會變成 OpenAI 的 `dimensions`
+  參數轉給 embedding 服務。
+- 密碼一律以 base64 送出（登入、建帳號、改密碼）：RAGFlow 存的是 hash(base64(密碼))，送明文會得到
+  `code=109 email and password do not match`。
 - 服務帳號密碼留空時自動產生，與 API key 一起寫回 `docker/.env`（`RAGFLOW_SERVICE_USER_PASSWORD`、
   `RAGFLOW_KB_API_KEY`），`./gen-env.sh --show` 會列出。Web 也用這個帳號登入。
 - 供應商預設 `OpenAI-API-Compatible`。它底層用 vLLM 的驅動，允許私有網段，所以 embedding 服務在
