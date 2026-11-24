@@ -327,6 +327,6 @@ for l in lines:
     print("  " + l)
 print(f"  （也寫在 {out}，權限 600）")
 print()
-print(f"Web 登入請用服務帳號 {cfg['user_email']}（密碼見 ./gen-env.sh --show 或 docker/.env 的"
-      " RAGFLOW_SERVICE_USER_PASSWORD）；超級管理員只能登入 Admin。")
+print(f"Web 登入請用服務帳號 {cfg['user_email']}，密碼是 {os.path.realpath(env_file)} 的"
+      " RAGFLOW_SERVICE_USER_PASSWORD（gen-env.sh --show 也會列出）；超級管理員只能登入 Admin。")
 PY

@@ -11,7 +11,7 @@
 #   ./gen-env.sh --dry-run           # 只列出會做什麼，不寫檔
 #   ./gen-env.sh --admin-email a@b.c # 指定第一個超級管理員的 email
 #   ./gen-env.sh --rotate            # 全部帳密重新產生（只在還沒有任何資料時允許）
-#   ./gen-env.sh --show              # 印出 docker/.env 目前的帳密
+#   ./gen-env.sh --show              # 印出 docker/.env 目前的帳密（找不到就看集中存放的那份）
 #   ./gen-env.sh --dir <部署目錄>    # 不在部署目錄執行時指定
 #   ./gen-env.sh --env-store <檔案>  # 真正的 .env 存放位置（預設見下）
 #   ./gen-env.sh --no-env-store      # .env 就放在 docker/ 底下，不另外存放
@@ -90,7 +90,15 @@ gen_secret(){
 }
 
 if [ "$SHOW" = "1" ]; then
-  [ -f "$ENV_FILE" ] || { red "找不到 $ENV_FILE"; exit 1; }
+  # 不在部署目錄執行（例如直接跑 repo 的 agentwiki/gen-env.sh）時，改看集中存放的那份
+  if [ ! -f "$ENV_FILE" ] && [ -n "$STORE" ] && [ "$STORE" != "none" ] && [ -f "$STORE" ]; then
+    ENV_FILE="$STORE"
+  fi
+  if [ ! -f "$ENV_FILE" ]; then
+    red "找不到 $ENV_FILE${STORE:+，也找不到 $STORE}"
+    red "repo 部署：runtime/gen-env.sh --show；部署包：在解開的目錄執行；或用 --dir / --env-store 指定"
+    exit 1
+  fi
   bold "==> $ENV_FILE 的帳密"
   echo "  超級管理員：$(getv DEFAULT_SUPERUSER_EMAIL || true) / $(getv DEFAULT_SUPERUSER_PASSWORD || true)"
   echo "  服務帳號（Web 登入、kb-stack）：$(getv RAGFLOW_SERVICE_USER_EMAIL || true) / $(getv RAGFLOW_SERVICE_USER_PASSWORD || true)"
