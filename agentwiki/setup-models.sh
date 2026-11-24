@@ -254,18 +254,24 @@ try:
               "model_info": [model_info]}, token=user_token)
         print(f"  已建立 instance「{cfg['instance']}」與模型「{cfg['model']}」")
 
-    data = call("POST", f"{api}/embeddings",
-                {"provider_name": cfg["provider"], "instance_name": cfg["instance"],
-                 "model_name": cfg["model"], "texts": ["AgentWiki embedding check"]},
-                token=user_token, timeout=120)
-    dim = None
+    # 實測：用 Web「測試連線」同一支 API，由 RAGFlow 容器實際對 embedding 服務打一次，結果記在
+    # 模型的 verify 狀態。不用 POST /embeddings：它要求請求帶 dimension、模型登記 max_dimension
+    # 與 max_batch_size，否則回 code 400 input dimension <= 0；帶了 dimension 又會轉成
+    # OpenAI 的 dimensions 參數送給 embedding 服務，不支援這個參數的服務可能拒絕。
+    inst_info = call("GET", f"{api}/providers/{prov}/instances/{inst}", token=user_token) or {}
+    inst_id = inst_info.get("id") if isinstance(inst_info, dict) else None
+    if not inst_id:
+        die(f"查不到 instance「{cfg['instance']}」的 id，無法實測連線")
     try:
-        first = data[0] if isinstance(data, list) else (data or {}).get("data", [None])[0]
-        vec = first.get("embedding") if isinstance(first, dict) else first
-        dim = len(vec) if isinstance(vec, list) else None
-    except (TypeError, IndexError, AttributeError):
-        pass
-    ok(f"  embedding 實測 ok{f'（維度 {dim}）' if dim else ''}")
+        call("POST", f"{api}/providers/{prov}/connection",
+             {"use_saved_credentials": True, "instance_id": inst_id,
+              "model_info": [{"model_name": cfg["model"], "model_type": ["embedding"]}]},
+             token=user_token, timeout=120)
+    except ApiError as e:
+        die(f"embedding 實測失敗（RAGFlow 容器 → {cfg['base_url']}）：{e}\n"
+            "  檢查：base URL 要含 /v1、模型名稱跟服務回報的一致、從 RAGFlow 容器連得到那個位址"
+            "（docker exec <ragflow-cpu 容器> curl -s <base URL>/models）。")
+    ok("  embedding 實測 ok（RAGFlow 容器 → embedding 服務）")
 
     # ---- 4) 預設 embedding 模型 ----
     step(4, "設為服務帳號的預設 embedding 模型")
