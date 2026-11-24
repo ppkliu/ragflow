@@ -14,6 +14,11 @@
 #   agentwiki/repo-deploy.sh up      同步部署檔並啟動（預設動作）
 #   agentwiki/repo-deploy.sh update  git pull --ff-only → 同步 → 有變動才重啟受影響的服務
 #   agentwiki/repo-deploy.sh build   在本機 build app image（需要外網），再 up
+#   agentwiki/repo-deploy.sh apply [--dry-run] [--recreate] [--force]
+#                                   改了 .env 之後用：比對上次成功套用的版本，依改到的鍵決定怎麼做
+#                                   （只給 setup-models 用的鍵不重啟；網段要 down 再 up；其他 up，
+#                                   compose 只重建設定有變的容器）。--recreate 一律強制重建 ragflow-cpu；
+#                                   密碼與 project 名稱只在初始化時生效，改了會拒絕，--force 才照做
 #   agentwiki/repo-deploy.sh down | status | logs [服務]
 #   agentwiki/repo-deploy.sh setup-models [參數]   轉給 runtime/setup-models.sh
 #
@@ -46,8 +51,11 @@ set_kv(){
 }
 compose(){
   local project; project="$(getv COMPOSE_PROJECT_NAME)"
+  local files=(-f "$RT/docker/docker-compose.yml")
+  # start.sh 產生的網段覆寫檔：少了它 compose 會以為網路設定變了
+  [ -f "$RT/docker/agentwiki-network.override.yml" ] && files+=(-f "$RT/docker/agentwiki-network.override.yml")
   docker compose -p "${project:-ragflow-v100}" --project-directory "$RT/docker" \
-    --env-file "$ENV_FILE" -f "$RT/docker/docker-compose.yml" "$@"
+    --env-file "$ENV_FILE" "${files[@]}" "$@"
 }
 default_image(){
   local ver; ver="$(git -C "$ROOT" describe --tags --abbrev=0 --match='v*' 2>/dev/null || echo latest)"
@@ -106,6 +114,16 @@ ensure_image(){
   echo "  image：$img"
 }
 
+# 上次成功套用的 .env 快照（含帳密，600；runtime/ 整個不進版控）。apply 拿它比對改了哪些鍵。
+APPLIED="$RT/.env.applied"
+save_applied(){ cp "$ENV_FILE" "$APPLIED" && chmod 600 "$APPLIED"; }
+# 有變動的鍵（新增、刪除、改值都算）
+env_changes(){
+  local norm='/^[A-Za-z_][A-Za-z0-9_]*=/p'
+  diff <(sed -n "$norm" "$APPLIED" | sort) <(sed -n "$norm" "$ENV_FILE" | sort) \
+    | sed -n 's/^[<>] \([^=]*\)=.*/\1/p' | sort -u
+}
+
 cmd="${1:-up}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   init)
@@ -139,6 +157,7 @@ case "$cmd" in
     merge_new_keys
     ensure_image
     "$RT/start.sh"
+    save_applied
     ;;
   update)
     need_env
@@ -155,6 +174,7 @@ case "$cmd" in
       grn "  docker/ 沒有變動（腳本已更新）；容器不需要重啟"
       # 容器沒在跑時順手啟動
       [ -n "$(compose ps -q 2>/dev/null)" ] || "$RT/start.sh"
+      save_applied
     else
       echo "  docker/ 變動：${CHANGED_DOCKER[*]}"
       # compose up -d 會重建設定有變的服務；掛進容器的檔案（entrypoint.sh、
@@ -165,6 +185,7 @@ case "$cmd" in
         compose restart ragflow-cpu
         "$RT/start.sh"
       fi
+      save_applied
     fi
     ;;
   build)
@@ -177,10 +198,79 @@ case "$cmd" in
       grn "image 已 build。接著：agentwiki/repo-deploy.sh init && agentwiki/repo-deploy.sh up"
     fi
     ;;
+  apply)
+    need_env
+    dry=0; recreate=0; force=0
+    for a in "$@"; do
+      case "$a" in
+        --dry-run|-n) dry=1 ;; --recreate) recreate=1 ;; --force) force=1 ;;
+        *) red "apply 不認得的參數：$a"; exit 2 ;;
+      esac
+    done
+    setup=(); danger=(); net=(); runtime=()
+    if [ -f "$APPLIED" ]; then
+      while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        case "$k" in
+          # 只有 setup-models.sh 讀；PICKED 是 start.sh 自己寫的
+          RAGFLOW_SETUP_*|RAGFLOW_SERVICE_USER_*|RAGFLOW_KB_API_KEY|RAGFLOW_NETWORK_SUBNET_PICKED) setup+=("$k") ;;
+          # 只在資料初始化時生效；project 名稱換了等於另起一套空的
+          COMPOSE_PROJECT_NAME|*_PASSWORD|MINIO_USER|DEFAULT_SUPERUSER_EMAIL) danger+=("$k") ;;
+          RAGFLOW_NETWORK_SUBNET) net+=("$k") ;;
+          *) runtime+=("$k") ;;
+        esac
+      done < <(env_changes)
+      bold "==> .env 與上次套用的版本相比"
+      [ "${#setup[@]}" -eq 0 ]   || echo "  只給 setup-models 用：${setup[*]}"
+      [ "${#net[@]}" -eq 0 ]     || echo "  網段：${net[*]}"
+      [ "${#runtime[@]}" -eq 0 ] || echo "  容器設定：${runtime[*]}"
+      [ "${#danger[@]}" -eq 0 ]  || red  "  只在初始化時生效：${danger[*]}"
+      if [ $((${#setup[@]} + ${#net[@]} + ${#runtime[@]} + ${#danger[@]})) -eq 0 ]; then
+        echo "  沒有變動"
+      fi
+    else
+      bold "==> 沒有上次套用的紀錄（$APPLIED）"
+      echo "  照 up 處理：compose 只重建設定有變的容器。成功後記下這次的 .env，之後就能精確比對。"
+      runtime=("(未知)")
+    fi
+
+    if [ "${#danger[@]}" -gt 0 ] && [ "$force" != 1 ]; then
+      red "拒絕套用：帳密與 project 名稱只在第一次初始化時生效。已有資料時改了，只會讓服務連不上"
+      red "資料庫，不會換掉密碼；改 COMPOSE_PROJECT_NAME 則會另起一套空的 RAGFlow。"
+      red "請把這些鍵改回原值（備份在 $(dirname "$(readlink -f "$ENV_FILE")")/ragflow.env.bak-*）。"
+      red "確定要照做（例如還沒有任何資料）：加 --force"
+      exit 1
+    fi
+
+    if [ "${#net[@]}" -gt 0 ]; then plan="down → up（重建網路）"
+    elif [ "${#runtime[@]}" -gt 0 ] || [ "${#danger[@]}" -gt 0 ]; then plan="up（重建設定有變的容器）"
+    elif [ "$recreate" = 1 ]; then plan="強制重建 ragflow-cpu"
+    else plan="不需要重啟"
+    fi
+    [ "$recreate" = 1 ] && [ "$plan" != "強制重建 ragflow-cpu" ] && plan="$plan，再強制重建 ragflow-cpu"
+    echo "  動作：$plan"
+    if [ "${#setup[@]}" -gt 0 ]; then
+      ylw "  setup-models 用的設定改了：要套用請再跑 agentwiki/repo-deploy.sh setup-models --public-host <主機>"
+    fi
+    [ "$dry" = 1 ] && exit 0
+
+    sync_files
+    case "$plan" in
+      down*) "$RT/stop.sh"; merge_new_keys; ensure_image; "$RT/start.sh" ;;
+      up*)   merge_new_keys; ensure_image; "$RT/start.sh" ;;
+    esac
+    if [ "$recreate" = 1 ]; then
+      bold "==> 強制重建 ragflow-cpu"
+      compose up -d --force-recreate ragflow-cpu
+      "$RT/start.sh"
+    fi
+    save_applied
+    grn "完成。這次的 .env 已記為套用基準。"
+    ;;
   down)    need_env; "$RT/stop.sh" ;;
   status)  need_env; compose ps ;;
   logs)    need_env; compose logs -f --tail=200 "${@:-ragflow-cpu}" ;;
   setup-models) need_env; sync_files; "$RT/setup-models.sh" "$@" ;;
-  -h|--help|help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) red "不認得的動作：$cmd（help 看用法）"; exit 2 ;;
 esac
