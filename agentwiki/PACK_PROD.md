@@ -186,6 +186,10 @@ agentwiki/repo-deploy.sh setup-models                         # 服務帳號、�
 # 之後每次更新
 agentwiki/repo-deploy.sh update     # git pull --ff-only → 同步 → 有變動才重啟受影響的服務
 agentwiki/repo-deploy.sh status | logs [服務] | down
+
+# 改了 .env 之後（真正的檔案在 /opt/AgentWiki/shared/env/ragflow.env）
+agentwiki/repo-deploy.sh apply --dry-run   # 先看會做什麼
+agentwiki/repo-deploy.sh apply             # 照做；--recreate 另外強制重建 ragflow-cpu
 ```
 
 - **為什麼有 `runtime/`**（預設在 repo 根目錄，`RAGFLOW_RUNTIME_DIR` 可改）：repo 的 `docker/.env` 是
@@ -199,6 +203,18 @@ agentwiki/repo-deploy.sh status | logs [服務] | down
 - **`update` 的重啟範圍**：`docker/` 沒變只更新腳本、不碰容器；有變就 `compose up -d`（重建設定有變的
   服務）；`entrypoint.sh` 或 `service_conf.yaml.template` 變了再重啟 `ragflow-cpu`，因為它們是掛進
   容器的檔案，compose 看不出內容變化。
+- **`apply` 怎麼決定動作**：拿 `.env` 跟上次 `up`/`update`/`apply` 成功時記下的快照
+  （`runtime/.env.applied`，600）比對改了哪些鍵。`.env` 是建立容器時讀進去的，`docker restart`
+  不會重讀，所以一律走 compose 重建：
+
+  | 改到的鍵 | 動作 |
+  |---|---|
+  | `RAGFLOW_SETUP_*`、`RAGFLOW_SERVICE_USER_*`、`RAGFLOW_KB_API_KEY` | 不重啟，提示重跑 `setup-models` |
+  | `RAGFLOW_NETWORK_SUBNET` | `down` → `up`，網路要重建 |
+  | 各種密碼、`MINIO_USER`、`DEFAULT_SUPERUSER_EMAIL`、`COMPOSE_PROJECT_NAME` | **拒絕**：只在初始化時生效，改了只會連不上；`--force` 才照做 |
+  | 其他（埠號、image 等） | `up`：compose 只重建設定有變的容器 |
+
+  沒有快照時（舊部署第一次用）照 `up` 處理，成功後才開始記錄。
 - **RAGFlow 本身（Go 程式與前端）在 image 裡**，`git pull` 換不掉。換版要 `repo-deploy.sh build`，
   或在建置機 build 後傳更新包、`docker load` 再 `repo-deploy.sh up`。
 - **`dist/` 自帶內容為 `*` 的 `.gitignore`**（pack-prod.sh 建立），數 GB 的打包產物不依賴上游 `.gitignore` 才被排除。
