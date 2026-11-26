@@ -13,6 +13,9 @@
 #   SKIP_BUILD=1 agentwiki/pack-prod.sh    # 跳過 docker build（沿用既有 image）
 #   NEED_MIRROR=1 agentwiki/pack-prod.sh   # build 時走官方 Dockerfile 的大陸鏡像
 #   GH_PROXY=https://gh-proxy.com/ ...     # native library 改走 GitHub 下載鏡像
+#   SKIP_TESTS=1 agentwiki/pack-prod.sh    # 跳過打包前的腳本自檢（語法 + 單元測試）
+#
+# 同名的舊包不會被覆寫：先移到 dist/old-<時間>/。打包完會解開清單逐一確認必要檔案都在。
 #
 # 相依 image 的清單不是寫死的：用 docker compose config --images 依 docker/.env 的
 # COMPOSE_PROFILES（預設 elasticsearch + cpu + metadata-mysql）算出來。改了
@@ -36,6 +39,26 @@ OUT_DIR="$ROOT/dist"
 if [ "$APP_ONLY" = "1" ]; then BUNDLE="ragflow-prod-update-${VERSION}"; else BUNDLE="ragflow-prod-${VERSION}"; fi
 STAGE="${OUT_DIR}/${BUNDLE}"
 TARBALL="${OUT_DIR}/${BUNDLE}.tar.gz"
+
+# ---- 打包前自檢：要送進內網的腳本先確定語法正確、測試通過（內網機壞了很難改）----
+SHIP_SH="gen-env.sh setup-models.sh start.sh stop.sh install.sh load-select.sh"
+SHIP_PY="migrate-datasets.py timewindow.py bench.py"
+bold "==> [0/6] 自檢要出貨的腳本"
+for f in $SHIP_SH; do bash -n "$HERE/$f" || { red "語法錯誤：agentwiki/$f"; exit 1; }; done
+if command -v python3 >/dev/null 2>&1; then
+  for f in $SHIP_PY; do
+    python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf8").read(), sys.argv[1])' "$HERE/$f" \
+      || { red "語法錯誤：agentwiki/$f"; exit 1; }
+  done
+  if [ "${SKIP_TESTS:-0}" != "1" ] && [ -f "$HERE/tests/test_migrate_datasets.py" ]; then
+    python3 "$HERE/tests/test_migrate_datasets.py" >/dev/null 2>&1 \
+      || { red "單元測試失敗：python3 agentwiki/tests/test_migrate_datasets.py（SKIP_TESTS=1 可略過）"; exit 1; }
+    echo "  單元測試通過"
+  fi
+else
+  echo "  ⚠ 沒有 python3，略過 .py 檢查"
+fi
+grn "  自檢通過"
 
 bold "==> [1/6] build app image: ${APP_IMAGE}  (APP_ONLY=${APP_ONLY})"
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
@@ -103,6 +126,23 @@ echo "RAGFLOW_IMAGE=${APP_IMAGE}" > "$STAGE/image.env"
 cp "$HERE/.env.example" "$STAGE/agentwiki.env.example"
 cp "$HERE/gen-env.sh" "$HERE/setup-models.sh" "$HERE/start.sh" "$HERE/stop.sh" "$STAGE/"
 chmod +x "$STAGE/gen-env.sh" "$STAGE/setup-models.sh" "$STAGE/start.sh" "$STAGE/stop.sh"
+# 一鍵安裝只對完整包有意義；更新包走 update.sh
+[ "$APP_ONLY" = "1" ] || { cp "$HERE/install.sh" "$STAGE/"; chmod +x "$STAGE/install.sh"; }
+# 目標機上的工具：舊版 dataset 搬遷（migrate-datasets 依賴同目錄的 timewindow）與效能比較
+cp "$HERE/migrate-datasets.py" "$HERE/timewindow.py" "$HERE/bench.py" "$STAGE/"
+chmod +x "$STAGE/migrate-datasets.py" "$STAGE/bench.py"
+# 打包來源，目標機出問題時用來對回 commit 與 image
+{
+  echo "VERSION=${VERSION}"
+  echo "BUNDLE=${BUNDLE}"
+  echo "GIT_COMMIT=$(git rev-parse --short HEAD)"
+  echo "GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)"
+  echo "GIT_DIRTY=$(git status --porcelain -- agentwiki docker | grep -q . && echo yes || echo no)"
+  echo "APP_IMAGE=${APP_IMAGE}"
+  echo "APP_IMAGE_ID=$(docker image inspect "$APP_IMAGE" --format '{{.Id}}')"
+  echo "ARCH=$(docker image inspect "$APP_IMAGE" --format '{{.Architecture}}')"
+  echo "PACKED_AT=$(date '+%Y-%m-%d %H:%M:%S %z')"
+} > "$STAGE/BUILD_INFO"
 
 bold "==> [4/6] 匯出 image -> images.tar"
 # shellcheck disable=SC2086
@@ -143,7 +183,8 @@ echo "==> 更新部署檔（被覆寫的舊檔備份到 \$BK）"
   mkdir -p "\$DEPLOY_DIR/docker/\$(dirname "\$f")"; cp -p "docker/\$f" "\$DEPLOY_DIR/docker/\$f"
 done
 cp docker/.env.example "\$DEPLOY_DIR/docker/.env.example"
-cp agentwiki.env.example gen-env.sh setup-models.sh start.sh stop.sh "\$DEPLOY_DIR/"
+cp agentwiki.env.example gen-env.sh setup-models.sh start.sh stop.sh BUILD_INFO \\
+   migrate-datasets.py timewindow.py bench.py "\$DEPLOY_DIR/"
 
 echo "==> \$ENV_FILE 的 RAGFLOW_IMAGE -> \$NEWTAG"
 set_kv "\$ENV_FILE" RAGFLOW_IMAGE "\$NEWTAG"
@@ -215,10 +256,14 @@ LOAD
 | docker/ | 官方 compose、設定範本（\`.env.example\`）、entrypoint 等部署檔 |
 | agentwiki.env.example | 建立 \`docker/.env\` 時套用：compose project 名稱、host 埠號、帳密欄位 |
 | image.env | 本次 app image 標籤（RAGFLOW_IMAGE） |
+| install.sh | 一鍵安裝：前置檢查 → sha256 → load.sh → start.sh → setup-models.sh（\`--check\` 只檢查） |
 | load.sh | 載入 image + 呼叫 gen-env.sh 備妥 \`docker/.env\` |
 | gen-env.sh | 建立 \`docker/.env\` 並自動產生帳密（\`--show\` 查看、\`--dry-run\` 預覽） |
 | setup-models.sh | 啟動後建立服務帳號、embedding 模型供應商與 API key，印出 kb-stack 設定 |
 | start.sh / stop.sh | 啟動（等到 API 健康檢查通過）/ 停止（volume 保留） |
+| migrate-datasets.py / timewindow.py | 把舊版（0.24 / 0.26）的 dataset 搬到這個 1.0（重新上傳、重新解析） |
+| bench.py | 比較兩個 RAGFlow 的解析時間與資源用量 |
+| BUILD_INFO | 打包來源：版本、git commit、image id、CPU 架構、打包時間 |
 
 相依 image：
 ${DEP_LIST}
@@ -228,7 +273,18 @@ ${DEP_LIST}
 - \`vm.max_map_count >= 262144\`（Elasticsearch 需要；start.sh 會檢查）
 - 建議至少 4 核 CPU、16 GB RAM、50 GB 磁碟（官方最低建議）
 
-## 步驟
+## 一鍵安裝
+\`\`\`bash
+sha256sum -c ${BUNDLE}.tar.gz.sha256
+tar -xzf ${BUNDLE}.tar.gz && cd ${BUNDLE}
+./install.sh --check       # 只做前置檢查（docker、vm.max_map_count、架構、磁碟、記憶體）
+./install.sh --admin-email ops@example.com \\
+  --embedding-url http://<embedding主機>:<埠>/v1 --embedding-model <模型名稱>
+\`\`\`
+沒給 embedding 參數時裝到啟動為止，之後在 \`docker/.env\` 填 \`RAGFLOW_SETUP_EMBEDDING_*\` 再跑
+\`./setup-models.sh\`。install.sh 可以重跑，已有的帳密、帳號、模型都沿用。
+
+## 分步驟（等同 install.sh 做的事）
 \`\`\`bash
 tar -xzf ${BUNDLE}.tar.gz && cd ${BUNDLE}
 ./load.sh                  # docker load + 產生 docker/.env（帳密自動產生，最後印出管理員帳密）
@@ -254,7 +310,25 @@ EOF
 fi
 
 bold "==> [6/6] 打包 -> ${TARBALL}"
+# 同名舊包移到 old-<時間>/，不直接覆寫：內網機上可能還在用那一份，要能對回去
+if [ -f "$TARBALL" ]; then
+  OLD="$OUT_DIR/old-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$OLD"
+  mv "$TARBALL" "$OLD/"; [ -f "$TARBALL.sha256" ] && mv "$TARBALL.sha256" "$OLD/"
+  echo "  舊包移到 $OLD/"
+fi
 tar -czf "$TARBALL" -C "$OUT_DIR" "$BUNDLE"
+# 解開清單確認必要檔案都在（不解壓 images.tar，只看清單）
+REQUIRED="images.tar image.env BUILD_INFO agentwiki.env.example gen-env.sh setup-models.sh start.sh stop.sh
+  migrate-datasets.py timewindow.py bench.py docker/docker-compose.yml docker/docker-compose-base.yml
+  docker/.env.example docker/entrypoint.sh docker/service_conf.yaml.template"
+if [ "$APP_ONLY" = "1" ]; then REQUIRED="$REQUIRED update.sh UPDATE.md"; else REQUIRED="$REQUIRED install.sh load.sh DEPLOY.md"; fi
+LIST="$(tar -tzf "$TARBALL")"
+for f in $REQUIRED; do
+  printf '%s\n' "$LIST" | grep -qxF "${BUNDLE}/$f" || { red "包內缺少 ${BUNDLE}/$f"; exit 1; }
+done
+printf '%s\n' "$LIST" | grep -q "/docker/\.env$" && { red "包內出現 docker/.env（不該帶帳密出去）"; exit 1; }
+echo "  內容檢查通過（$(printf '%s\n' "$LIST" | wc -l) 個項目）"
 rm -rf "$STAGE"        # 只留最終 tar.gz
 ( cd "$OUT_DIR" && sha256sum "$(basename "$TARBALL")" > "$(basename "$TARBALL").sha256" )
 # 目標機挑包用（掃描目錄 → 選擇 → 確認 → 載入），跟 tar.gz 一起搬過去
@@ -265,5 +339,5 @@ grn "完成：${TARBALL} (${SIZE})"
 if [ "$APP_ONLY" = "1" ]; then
   echo "目標機：tar -xzf ${BUNDLE}.tar.gz && cd ${BUNDLE} && ./update.sh <既有部署目錄>"
 else
-  echo "目標機：tar -xzf ${BUNDLE}.tar.gz && cd ${BUNDLE} && ./load.sh && ./start.sh"
+  echo "目標機：tar -xzf ${BUNDLE}.tar.gz && cd ${BUNDLE} && ./install.sh"
 fi
