@@ -314,6 +314,9 @@ agentwiki/migrate-datasets.py verify $A --all --include-kb
 - 一把 key 只看得到一個帳號的 dataset，每個帳號各跑一次。
 - 報告在 `AgentWiki/bak/ragflow-migrate/datasets-<時間>/`，含兩邊的比對結果和 **dataset id 對照表**（`id-map.json`）。
   其他工具用 dataset id 查詢的，切到 1.0 時照這張表改設定。
+- **只在離峰時段搬**：`run ... --window "mon-fri 22:30-07:00; sat-sun all"` 時段外不跑，快結束時等手上這批解析完就暫停。
+  `schedule-install <run 的參數>` 會裝一行 crontab 自動接著做，做完自動移除；`schedule-status`、`schedule-remove`。
+  排程的 key 要用 `file:<路徑>`，因為 cron 讀不到環境變數。時段寫法見 `agentwiki/timewindow.py`。
 - 測試：`python3 agentwiki/tests/test_migrate_datasets.py`，用假的 0.26 和假的 1.0 伺服器測，不需要真的 RAGFlow。
 - 完整流程，以及 RAGFlow 在整個系統裡的角色，見 kb-stack 的 `docs/RAGFLOW_V1_MIGRATION_PLAN.md`
   第〇之一、七、八節。
