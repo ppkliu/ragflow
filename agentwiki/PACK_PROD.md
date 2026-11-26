@@ -23,13 +23,14 @@
                               ▼
 ══════════════ 目標機（離線，Docker + Compose v2）══════════════
  ./load-select.sh <dir>   或手動：
-   完整包 ─▶ tar -xzf → ./load.sh（自動產生 docker/.env 與帳密）→ ./start.sh
+   完整包 ─▶ tar -xzf → ./install.sh（前置檢查 → load → start → setup-models，一次做完）
    更新包 ─▶ tar -xzf → ./update.sh <既有部署目錄>
 ```
 
 | 腳本 | 在哪台 | 做什麼 |
 |---|---|---|
 | `agentwiki/pack-prod.sh` | 建置機 | 打包完整包 / 更新包（`APP_ONLY=1`） |
+| `agentwiki/install.sh` | 目標機 | 完整包一鍵安裝：前置檢查、sha256、load.sh、start.sh、setup-models.sh（可重跑） |
 | `agentwiki/load-select.sh` | 目標機 | 掃描 / 選擇 / 確認 / 載入 tar.gz（打包時會複製到 `dist/`） |
 | `load.sh`（包內生成） | 目標機 | 完整包：`docker load` + 呼叫 gen-env.sh |
 | `agentwiki/gen-env.sh` | 目標機 | 建立 `docker/.env`（官方範本 + `agentwiki/.env.example`）並自動產生帳密 |
@@ -56,8 +57,10 @@ NEED_MIRROR=1 agentwiki/pack-prod.sh        # build 時改走官方 Dockerfile �
 RAGFLOW_IMAGE=myrepo/ragflow:rc1 agentwiki/pack-prod.sh
 ```
 
-腳本的 6 個步驟：
+腳本的步驟：
 
+0. 自檢要出貨的腳本：`bash -n`、`.py` 語法、`tests/test_migrate_datasets.py`（`SKIP_TESTS=1` 略過）。
+   內網機上壞掉的腳本很難修，所以在這裡擋
 1. 先 build 衍生 runner `agentwiki-ragflow-runner:<版本>`（見下方「build runner 缺 native
    library」），再 `docker build` 出 `agentwiki-ragflow:<版本>`（另加 `:latest`）
 2. 用 `docker compose config --images` 依 `docker/.env` 的 `COMPOSE_PROFILES` 算出相依 image，
@@ -65,10 +68,36 @@ RAGFLOW_IMAGE=myrepo/ragflow:rc1 agentwiki/pack-prod.sh
 3. 複製**進版控的** `docker/` 檔案（執行期資料不會被帶走），官方 `docker/.env` 改名成
    `.env.example`
 4. `docker save` → `images.tar`
-5. 產生部署端 `load.sh`／`update.sh` 與說明
-6. 打包成 `dist/ragflow-prod-<版本>.tar.gz`，並產生 `.sha256`
+5. 產生部署端 `load.sh`／`update.sh` 與說明，寫入 `BUILD_INFO`（版本、git commit、是否有未提交修改、
+   app image id、CPU 架構、打包時間）
+6. 打包成 `dist/ragflow-prod-<版本>.tar.gz`，並產生 `.sha256`。同名舊包先移到 `dist/old-<時間>/`，
+   不會被覆寫；打完列出包內清單，確認必要檔案都在、沒有夾帶 `docker/.env`
+
+包內除了部署腳本，還帶目標機用得到的工具：`migrate-datasets.py` + `timewindow.py`（舊版 dataset
+搬遷，見四之二）與 `bench.py`（見四之一）。只用 Python 標準函式庫。
 
 ## 二、目標機
+
+一鍵安裝（tar.gz 與 `.sha256` 放在同一層，install.sh 會自己找來驗證）：
+
+```bash
+tar -xzf ragflow-prod-v1.0.0.tar.gz && cd ragflow-prod-v1.0.0
+./install.sh --check                         # 只做前置檢查，不動任何東西
+./install.sh --admin-email ops@example.com \
+  --embedding-url http://<embedding主機>:<埠>/v1 --embedding-model bge-m3
+```
+
+| 前置檢查 | 沒過時 |
+|---|---|
+| docker、Compose v2、`vm.max_map_count >= 262144`、CPU 架構跟 `BUILD_INFO` 一致、sha256 | 停下並印出修正指令 |
+| python3、Docker 目錄可用空間（images.tar 兩倍 + 20 GB）、記憶體 16 GB | 只警告 |
+
+之後依序跑 `load.sh` → 把 `--embedding-*` 寫進 `docker/.env` → `start.sh` → `setup-models.sh`。
+沒給 embedding 參數、`.env` 也沒填時，裝到啟動為止，之後再跑 `./setup-models.sh`。可以重跑：帳密、
+服務帳號、模型、API key 都沿用。其他參數：`--public-host`、`--env-store`/`--no-env-store`、
+`--skip-sha`、`--no-setup-models`、`-y`。
+
+分步驟做（install.sh 做的就是這些）：
 
 ```bash
 sha256sum -c ragflow-prod-v1.0.0.tar.gz.sha256
