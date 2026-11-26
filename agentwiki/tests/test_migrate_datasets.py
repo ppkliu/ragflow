@@ -15,6 +15,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -22,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("migrate", os.path.join(HERE, "..", "migrate-datasets.py"))
 migrate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(migrate)
+timewindow = migrate.timewindow
 
 V1_CREATE_FIELDS = {"name", "embedding_model", "parser_config", "language", "permission", "parser_id",
                     "pipeline_id", "pipeline_version_id", "parse_type"}
@@ -185,13 +187,17 @@ class MigrateTest(unittest.TestCase):
         self.src.add_dataset("space_eng", chunk_method="naive")          # kb-stack：預設略過
         self.src.add_dataset("kbbench_v024_x", chunk_method="naive")     # 壓測暫用：略過
         self.dst.fail_names = {"bad.pdf"}
-        self.out = tempfile.mkdtemp()
+        # 報告目錄的上一層放 migrate-datasets.lock：放在測試自己的暫存目錄裡
+        self.tmp = tempfile.mkdtemp()
+        self.out = os.path.join(self.tmp, "out")
+        self._now, self._wait = migrate._now, migrate.wait_parsed.__defaults__
 
     def tearDown(self):
+        migrate._now, migrate.wait_parsed.__defaults__ = self._now, self._wait
         for srv in (self.s1, self.s2):
             srv.shutdown()
             srv.server_close()
-        shutil.rmtree(self.out, ignore_errors=True)
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def report(self):
         with open(os.path.join(self.out, "report.md"), encoding="utf-8") as f:
@@ -278,6 +284,156 @@ class MigrateTest(unittest.TestCase):
         self.assertTrue(migrate.unstarted({"ingestion_status": "CREATED"}))
         self.assertFalse(migrate.unstarted({"run": "RUNNING", "progress": 0.3}))
         self.assertFalse(migrate.unstarted({"ingestion_status": "COMPLETED", "progress": 1}))
+
+
+    # ------------------------------------------------------------ 離峰時段
+
+    def today_only(self):
+        """只有今天全天的時段：現在一定在內，到今晚 24:00 結束。"""
+        return f"{timewindow.DAYS[datetime.now().weekday()]} all"
+
+    def test_window_closed_does_nothing(self):
+        tomorrow = timewindow.DAYS[(datetime.now().weekday() + 1) % 7]
+        code, out = self.run_cli("run", "--all", "--window", f"{tomorrow} all")
+        self.assertEqual(code, 3)
+        self.assertIn("不在離峰時段", out)
+        self.assertEqual(self.dst.calls, [], "時段外連 API 都不碰")
+
+    def test_window_closing_soon_pauses_before_upload(self):
+        end = timewindow.closes_at(timewindow.parse(self.today_only()), datetime.now()).timestamp()
+        migrate._now = lambda: end - 60   # 剩 1 分鐘 < 上傳估計 + 餘量
+        code, out = self.run_cli("run", "--all", "--window", self.today_only())
+        self.assertEqual(code, 3)
+        self.assertIn("不再上傳", out)
+        self.assertFalse(any(m == "POST" and p.endswith("/documents") for m, p in self.dst.calls))
+        self.assertIn("離峰時段結束，暫停", self.report())
+
+        # 時間夠了再跑：接著做完
+        migrate._now = self._now
+        migrate.wait_parsed.__defaults__ = (0,)
+        self.dst.fail_names = set()
+        code2, _ = self.run_cli("run", "--all", "--window", self.today_only())
+        self.assertEqual(code2, 0)
+        [ds] = list(self.dst.datasets.values())
+        self.assertEqual(len(self.dst.docs[ds["id"]]), 3)
+
+    def test_deadline_estimates_from_previous_batches(self):
+        migrate._now = lambda: 0
+        self.assertTrue(migrate.Deadline(None).allows(10 ** 9))
+        dl = migrate.Deadline(until=1000)
+        self.assertTrue(dl.allows(dl.batch_est()), "第一批只要剩下的 ≥ 餘量")
+        dl.batches = [100, 900]   # 平均 500、最近 900 → 估 900
+        self.assertEqual(dl.batch_est(), 900)
+        self.assertFalse(dl.allows(dl.batch_est()))
+        self.assertTrue(dl.paused)
+        self.assertFalse(dl.allows(0), "暫停之後就不再開始新的")
+
+    def test_second_run_waits_for_lock(self):
+        os.makedirs(self.tmp, exist_ok=True)
+        held = migrate.lock_run(self.out)
+        try:
+            code, out = self.run_cli("run", "--all")
+            self.assertEqual(code, 4)
+            self.assertIn("已經有一個 run 在跑", out)
+        finally:
+            held.close()
+
+    def test_schedule_install_run_and_auto_remove(self):
+        cron = os.path.join(self.tmp, "crontab.txt")
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir)
+        with open(os.path.join(bindir, "crontab"), "w") as f:
+            f.write(f'#!/bin/sh\nif [ "$1" = -l ]; then cat "{cron}" 2>/dev/null || exit 1; else cat > "{cron}.new" && mv "{cron}.new" "{cron}"; fi\n')
+        os.chmod(os.path.join(bindir, "crontab"), 0o755)
+        with open(cron, "w") as f:
+            f.write("0 3 * * * /other/job\n")
+        keyf = os.path.join(self.tmp, "k.key")
+        with open(keyf, "w") as f:
+            f.write("k\n")
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = bindir + os.pathsep + old_path
+        sched = os.path.join(self.tmp, "sched")
+        base = ["--src", self.src_url, "--dst", self.dst_url, "--dataset", "agent_manuals", "--batch", "2",
+                "--out", sched]
+        try:
+            with redirect_stdout(io.StringIO()):
+                # 直接寫 key 會留在 crontab：拒絕
+                with self.assertRaises(SystemExit):
+                    migrate.main(["schedule-install", *base, "--src-key", "k", "--dst-key", f"file:{keyf}"])
+                self.assertEqual(migrate.main(["schedule-install", *base, "--src-key", f"file:{keyf}",
+                                               "--dst-key", f"file:{keyf}", "--window", self.today_only()]), 0)
+            with open(cron) as f:
+                lines = f.read().splitlines()
+            self.assertEqual(lines[0], "0 3 * * * /other/job", "別人的排程要留著")
+            self.assertIn("--scheduled", lines[1])
+            self.assertIn(f"file:{keyf}", lines[1])
+            self.assertIn(migrate.CRON_TAG, lines[1])
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                migrate.schedule_status(migrate.argparse.Namespace(out=None))
+            self.assertIn("已安裝", buf.getvalue())
+            self.assertIn("時段內", buf.getvalue())
+
+            # 照 crontab 那一行的參數跑一次（就是 cron 會做的事）
+            migrate.wait_parsed.__defaults__ = (0,)
+            self.dst.fail_names = set()
+            argv = migrate.shlex.split(lines[1].split(">>")[0])[8:]   # 去掉排程的 5 欄、PATH=…、python、腳本
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(migrate.main(argv), 0)
+            with open(cron) as f:
+                self.assertEqual(f.read().splitlines(), ["0 3 * * * /other/job"], "全部一致後自動移除")
+            self.assertTrue(os.path.exists(os.path.join(sched, "done")))
+            logs = [x for x in os.listdir(sched) if x.startswith("schedule-")]
+            self.assertEqual(len(logs), 1)
+            with open(os.path.join(sched, logs[0]), encoding="utf-8") as f:
+                self.assertIn("排程啟動", f.read())
+        finally:
+            os.environ["PATH"] = old_path
+
+    def test_scheduled_failures_remove_after_three(self):
+        out = os.path.join(self.tmp, "s")
+        os.makedirs(out)
+        removed = []
+        orig = migrate.schedule_remove
+        migrate.schedule_remove = lambda why: removed.append(why)
+        try:
+            with redirect_stdout(io.StringIO()):
+                for _ in range(3):
+                    migrate.after_scheduled(out, 1)
+            self.assertEqual(len(removed), 1)
+            self.assertIn("連續 3 次失敗", removed[0])
+            with redirect_stdout(io.StringIO()):
+                migrate.after_scheduled(out, 3)
+            self.assertFalse(os.path.exists(os.path.join(out, "failures")), "暫停（正常）會清掉失敗計數")
+        finally:
+            migrate.schedule_remove = orig
+
+
+class TimeWindowTest(unittest.TestCase):
+    W = "mon-fri 22:30-07:00; sat-sun all"
+
+    def at(self, s):
+        return datetime.fromisoformat(s)
+
+    def test_weekday_nights_and_weekends(self):
+        segs = timewindow.parse(self.W)
+        self.assertFalse(timewindow.is_open(segs, self.at("2026-11-27T12:00")))   # 週五中午
+        self.assertEqual(timewindow.opens_at(segs, self.at("2026-11-27T12:00")), self.at("2026-11-27T22:30"))
+        self.assertTrue(timewindow.is_open(segs, self.at("2026-11-27T23:00")))
+        self.assertEqual(timewindow.closes_at(segs, self.at("2026-11-27T23:00")), self.at("2026-11-30T07:00"),
+                         "週五晚上接週末，一路到週一 07:00")
+        self.assertTrue(timewindow.is_open(segs, self.at("2026-12-02T06:59")))
+        self.assertFalse(timewindow.is_open(segs, self.at("2026-12-02T07:00")))
+
+    def test_syntax(self):
+        self.assertTrue(timewindow.is_open(timewindow.parse("22:00-06:00"), self.at("2026-11-26T23:59")))
+        self.assertTrue(timewindow.is_open(timewindow.parse("fri-mon all"), self.at("2026-11-30T12:00")))
+        self.assertFalse(timewindow.is_open(timewindow.parse("fri-mon all"), self.at("2026-12-01T12:00")))
+        self.assertIsNone(timewindow.closes_at(timewindow.parse("all all"), self.at("2026-12-01T12:00")))
+        for bad in ["", "xx 01:00-02:00", "mon 25:00-02:00", "mon 01:00-01:00", "mon 1-2", "a b c"]:
+            with self.assertRaises(ValueError, msg=bad):
+                timewindow.parse(bad)
 
 
 if __name__ == "__main__":
