@@ -296,6 +296,28 @@ agentwiki/bench.py --files ~/bench-files \
 - 計時用單調時鐘，主機校時（WSL 常見）不會讓耗時失真。
 - 兩邊的解析器、並行 worker 數與 embedding 模型不同時，比的是「整套預設行為」。
 
+## 四之二、把舊版的 dataset 搬過來（`migrate-datasets.py`）
+
+舊版是 0.24 或 0.26 都可以，跟 1.0 的 API 差異由工具自動處理。兩版的儲存格式不同，不能直接拷 ES 或 MinIO，
+所以作法是**下載原檔，在 1.0 建同名 dataset，重新上傳、重新解析**。解析設定會一起帶過去。
+
+```bash
+export SRC_KEY=<舊版帳號的 API key> DST_KEY=<1.0 對應帳號的 API key>
+A="--src http://<舊版主機>:<埠> --src-key env:SRC_KEY --dst http://<1.0 主機>:19383 --dst-key env:DST_KEY"
+agentwiki/migrate-datasets.py list --src http://<舊版主機>:<埠> --src-key env:SRC_KEY
+agentwiki/migrate-datasets.py plan   $A --all      # 不寫入
+agentwiki/migrate-datasets.py run    $A --all      # 可以重跑，中斷了接著做
+agentwiki/migrate-datasets.py verify $A --all --include-kb
+```
+
+- kb-stack 的 `space_*` 預設略過，那些要用 kb-stack 的 `scripts/ragflow-migrate.sh` 重建。
+- 一把 key 只看得到一個帳號的 dataset，每個帳號各跑一次。
+- 報告在 `AgentWiki/bak/ragflow-migrate/datasets-<時間>/`，含兩邊的比對結果和 **dataset id 對照表**（`id-map.json`）。
+  其他工具用 dataset id 查詢的，切到 1.0 時照這張表改設定。
+- 測試：`python3 agentwiki/tests/test_migrate_datasets.py`，用假的 0.26 和假的 1.0 伺服器測，不需要真的 RAGFlow。
+- 完整流程，以及 RAGFlow 在整個系統裡的角色，見 kb-stack 的 `docs/RAGFLOW_V1_MIGRATION_PLAN.md`
+  第〇之一、七、八節。
+
 ## 五、注意事項
 
 - **build runner 缺 native library（2026-11-19 實際踩到）。** 官方 Dockerfile 的 go-builder 階段
