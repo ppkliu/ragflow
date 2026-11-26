@@ -20,13 +20,23 @@ kb-stack 自己的管線重建（Cognee 與 ragflow_document_id 才對得起來�
           已上傳但還沒解析的會補解析。中斷了直接再跑一次
   verify  兩邊逐 dataset 比文件數、解析成功數、chunk 數，列出目標缺少或解析失敗的文件
 
+離峰時段自動搬（見 timewindow.py 的時段寫法）：
+  agentwiki/migrate-datasets.py run ... --window "mon-fri 22:30-07:00; sat-sun all"
+      只在時段內做：時段外直接結束（代碼 3）；快結束時不再上傳、不再排下一批解析
+      （一批要多久用前面各批估），等手上這批解析完就暫停（代碼 3），下次 run 接著做
+  agentwiki/migrate-datasets.py schedule-install <run 的參數> [--window ...] [--every 15]
+      裝一行 crontab，每 15 分鐘叫一次 run --window --scheduled；全部一致後自動移除，
+      連續 3 次失敗也移除（同一個問題每 15 分鐘重試沒有意義）。key 要寫成 file:<路徑>
+  agentwiki/migrate-datasets.py schedule-status | schedule-remove
+
   報告都附「dataset id 對照」（舊 id → 新 id，也輸出成 id-map.json）：其他 agent 工具若用 dataset id
   而不是名稱查詢，切到 1.0 時要照這張表改設定。kb-stack 的 space_* 由 ragflow-migrate.sh 重建後，
   用 verify --include-kb 也能拿到它們的對照。
 
 選項：
   --src / --dst          base URL，例如 http://<主機>:9380（舊版）、http://<主機>:19383（1.0）
-  --src-key / --dst-key  API key；寫成 env:變數名 時從環境變數讀（key 不會留在 ps 與 shell history）
+  --src-key / --dst-key  API key；寫成 env:變數名 時從環境變數讀、file:路徑 時從檔案讀
+                         （key 不會留在 ps 與 shell history；排程只能用 file:，cron 沒有你的環境變數）
   --dataset a,b          只處理這些 dataset（名稱或 id）
   --all                  全部（run 沒給 --dataset 時必須明確加）
   --include-kb           連 kb-stack 的 space_* 一起搬（通常不要，見上）
@@ -36,7 +46,9 @@ kb-stack 自己的管線重建（Cognee 與 ragflow_document_id 才對得起來�
   --batch-timeout <分>   一批最多等多久（預設 120）
   --no-parse             只上傳不解析
   --out <目錄>           報告位置（預設 AgentWiki/bak/ragflow-migrate/datasets-<時間>，
-                         不在 AgentWiki 工作區時是 ~/ragflow-migrate/datasets-<時間>）
+                         不在 AgentWiki 工作區時是 ~/ragflow-migrate/datasets-<時間>；排程固定用 datasets-scheduled）
+  --window <時段>        只在這個時段內搬（run）；schedule-install 沒給時是 "mon-fri 22:30-07:00; sat-sun all"
+  --every <分>           schedule-install：crontab 每幾分鐘叫一次（預設 15）
 
 ★ API key 決定看得到哪些 dataset：每個 key 只看得到自己帳號（tenant）的。其他 agent 工具若各用
   各的 RAGFlow 帳號，要對每個帳號各跑一次，目標端也用對應的 1.0 帳號的 key。
@@ -45,11 +57,17 @@ kb-stack 自己的管線重建（Cognee 與 ragflow_document_id 才對得起來�
 ★ 1.0 只拒絕不認得的欄位，不會默默丟掉：舊版的 parser_config 有 1.0 不收的鍵時，建 dataset 會失敗，
   這時改用 1.0 的預設 parser_config 重建並在報告註記，chunk 結果可能跟舊版不同。
 
-結束代碼：0 = 全部成功；1 = 有失敗、逾時或比對不一致；2 = 用法錯誤
+★ 同一時間只會有一個 run（手動與排程的都算）：報告目錄上一層的 migrate-datasets.lock。
+
+結束代碼：0 = 全部成功；1 = 有失敗、逾時或比對不一致；2 = 用法錯誤；
+          3 = 時段外沒跑、或時段結束暫停（下次接著做）；4 = 已有一個 run 在跑
 """
 import argparse
+import fcntl
 import json
 import os
+import shlex
+import subprocess
 import sys
 import time
 import urllib.error
@@ -58,6 +76,12 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench import Api, detect, doc_state, log, multipart  # noqa: E402
+import timewindow  # noqa: E402
+
+CRON_TAG = "# agentwiki-migrate-datasets:" + os.path.abspath(__file__)
+SCHEDULED_DIR = "datasets-scheduled"
+UPLOAD_EST_S = 60     # 估一份上傳要多久（含下載）
+MARGIN_S = 300        # 時段結束前留的餘量
 
 SKIP_PREFIXES_KB = ("space_",)
 SKIP_PREFIXES_TEMP = ("kbbench_", "kbstack_")
@@ -168,6 +192,29 @@ class Side:
             except ValueError:
                 pass
         return body
+
+
+def _now():
+    return time.time()
+
+
+class Deadline:
+    """--window：時段結束前停手。排進 RAGFlow 的解析中途停不下來，所以是「不再開始新的」。"""
+
+    def __init__(self, until=None):
+        self.until = until          # epoch 秒；None = 不限
+        self.batches = []           # 各批解析實際耗時（秒）
+        self.paused = False
+
+    def batch_est(self):
+        b = self.batches
+        return max(sum(b) / len(b), b[-1]) if b else 0
+
+    def allows(self, est):
+        """剩下的時間夠做完 est 秒（加餘量）才回 True；不夠就記下暫停。"""
+        if self.until is not None and self.until - _now() < est + MARGIN_S:
+            self.paused = True
+        return not self.paused
 
 
 def chunk_method(obj):
@@ -292,9 +339,10 @@ def wait_parsed(dst, ds_id, ids, timeout_s, poll=10):
     return final, pending
 
 
-def migrate_one(src, dst, ds, args):
+def migrate_one(src, dst, ds, args, dl=None):
+    dl = dl or Deadline()
     res = {"name": ds["name"], "src_id": ds["id"], "uploaded": 0, "skipped": 0, "failed": [], "notes": [],
-           "parsed": {"done": 0, "failed": 0, "canceled": 0, "timeout": 0}}
+           "paused": False, "parsed": {"done": 0, "failed": 0, "canceled": 0, "timeout": 0}}
     log(f"== {ds['name']}（{chunk_method(ds)}）")
     target = dst.find_dataset(ds["name"])
     if target:
@@ -323,6 +371,9 @@ def migrate_one(src, dst, ds, args):
                 to_parse.append(have["id"])  # 上次上傳了、沒排到解析
                 names[have["id"]] = d.get("name")
             continue
+        if not dl.allows(UPLOAD_EST_S):
+            log("   ⏸ 離峰時段快結束，不再上傳")
+            break
         try:
             content = src.download(ds["id"], d["id"])
             new_id = dst.upload(target["id"], d["name"], content)
@@ -347,13 +398,23 @@ def migrate_one(src, dst, ds, args):
         to_parse.append(new_id)
         names[new_id] = d.get("name")
 
-    if args.no_parse or not to_parse:
-        return res
+    if not (args.no_parse or not to_parse):
+        parse_batches(dst, target, to_parse, names, args, dl, res)
+    res["paused"] = dl.paused
+    return res
+
+
+def parse_batches(dst, target, to_parse, names, args, dl, res):
     for i in range(0, len(to_parse), args.batch):
         batch = to_parse[i:i + args.batch]
+        if not dl.allows(dl.batch_est()):
+            log(f"   ⏸ 離峰時段快結束，剩 {len(to_parse) - i} 份還沒排解析（下次 run 會補排）")
+            return
         log(f"   解析 [{min(i + args.batch, len(to_parse))}/{len(to_parse)}]")
+        t0 = _now()
         dst.parse(target["id"], batch)
         final, pending = wait_parsed(dst, target["id"], batch, args.batch_timeout * 60)
+        dl.batches.append(_now() - t0)
         for d in final.values():
             res["parsed"][doc_state(d)] = res["parsed"].get(doc_state(d), 0) + 1
             if doc_state(d) != "done":
@@ -362,7 +423,6 @@ def migrate_one(src, dst, ds, args):
         res["parsed"]["timeout"] += len(pending)
         for pid in pending:
             res["failed"].append({"file": names.get(pid, pid), "error": f"這批等了 {args.batch_timeout} 分鐘仍未完成"})
-    return res
 
 
 def compare_one(src, dst, ds):
@@ -394,14 +454,19 @@ def row_ok(r):
     return not r["missing"] and not r["not_done"]
 
 
-def write_report(out, src, dst, args, results, compare):
+def write_report(out, src, dst, args, results, compare, paused=False):
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "result.json"), "w") as f:
         json.dump({"src": str(src), "dst": str(dst), "results": results, "compare": compare},
                   f, ensure_ascii=False, indent=2)
     L = [f"# RAGFlow dataset 搬移（{datetime.now():%Y-%m-%d %H:%M}）", "",
          f"- 來源：{src.version}（{src.dialect} API）", f"- 目標：{dst.version}（{dst.dialect} API）",
-         f"- embedding：{args.embedding or '目標帳號預設'}", ""]
+         f"- embedding：{args.embedding or '目標帳號預設'}"]
+    if getattr(args, "window", None):
+        L.append(f"- 時段：`{args.window}`")
+    if paused:
+        L.append("- ⏸ **離峰時段結束，暫停**：還沒做完的下次 run 會接著做（下面的比對因此還不一致）")
+    L.append("")
     if results:
         L += ["## 搬移", "", "| dataset | 上傳 | 已存在略過 | 解析成功 | 解析失敗 | 逾時 | 上傳失敗 |",
               "|---|---:|---:|---:|---:|---:|---:|"]
@@ -457,15 +522,176 @@ def key_of(v):
         if not k:
             raise SystemExit(f"環境變數 {v[4:]} 沒有設定")
         return k
+    if v and v.startswith("file:"):
+        try:
+            with open(os.path.expanduser(v[5:]), encoding="utf-8") as f:
+                k = f.read().strip()
+        except OSError as e:
+            raise SystemExit(f"讀不到 key 檔 {v[5:]}：{e}") from e
+        if not k:
+            raise SystemExit(f"key 檔 {v[5:]} 是空的")
+        return k
     return v
+
+
+# ---------------------------------------------------------------- 排程
+
+def lock_run(out):
+    """同一時間只能有一個 run。回傳要一直留著的檔案物件；已有人在跑就回 None。"""
+    base = os.path.dirname(os.path.abspath(out))
+    os.makedirs(base, exist_ok=True)
+    f = open(os.path.join(base, "migrate-datasets.lock"), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def crontab_lines():
+    try:
+        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    except FileNotFoundError as e:
+        raise SystemExit("這台沒有 crontab 指令（裝 cron，或用 systemd timer 定時跑 run --window --scheduled）") from e
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def crontab_write(lines):
+    subprocess.run(["crontab", "-"], input="".join(x + "\n" for x in lines), text=True, check=True)
+
+
+def schedule_remove(reason):
+    lines = crontab_lines()
+    keep = [x for x in lines if CRON_TAG not in x]
+    if len(keep) == len(lines):
+        log("沒有安裝排程")
+        return False
+    crontab_write(keep)
+    log(f"已移除排程的 crontab（{reason}）")
+    return True
+
+
+def scheduled_out(args):
+    return args.out or os.path.join(os.path.dirname(default_out()), SCHEDULED_DIR)
+
+
+RUN_FLAGS = ("--src", "--src-key", "--dst", "--dst-key", "--dataset", "--embedding", "--batch", "--batch-timeout")
+
+
+def schedule_install(args, wanted):
+    for k in ("src_key", "dst_key"):
+        if not str(getattr(args, k) or "").startswith("file:"):
+            raise SystemExit(f"排程的 --{k.replace('_', '-')} 要寫成 file:<路徑>：cron 沒有你的環境變數，"
+                             "直接寫 key 會留在 crontab 裡。例如 printf '%s' \"$SRC_KEY\" > ~/.ragflow-src.key; chmod 600 ~/.ragflow-src.key")
+    if not 1 <= args.every <= 59:
+        raise SystemExit("--every 要是 1–59 的分鐘數")
+    window = args.window or timewindow.DEFAULT
+    segs = timewindow.parse(window)
+    out = os.path.abspath(scheduled_out(args))
+    os.makedirs(out, exist_ok=True)
+    for k in ("src_key", "dst_key"):
+        key_of(getattr(args, k))   # 現在就讀一次，key 檔有問題不要等到半夜才發現
+    cmd = [sys.executable, os.path.abspath(__file__), "run"]
+    for flag in RUN_FLAGS:
+        v = getattr(args, flag[2:].replace("-", "_"))
+        if v is not None:
+            cmd += [flag, str(v)]
+    for flag in ("--all", "--include-kb", "--no-parse"):
+        if getattr(args, flag[2:].replace("-", "_")):
+            cmd.append(flag)
+    cmd += ["--window", window, "--scheduled", "--out", out]
+    path = ":".join(dict.fromkeys([os.path.dirname(sys.executable), "/usr/local/bin", "/usr/bin", "/bin"]))
+    line = (f"*/{args.every} * * * * PATH={shlex.quote(path)} {' '.join(shlex.quote(c) for c in cmd)} "
+            f">> {shlex.quote(os.path.join(out, 'cron.log'))} 2>&1 {CRON_TAG}")
+    if "%" in line:
+        raise SystemExit("參數或路徑裡有 %（crontab 會當成換行），換個 --out 或 key 檔路徑")
+    crontab_write([x for x in crontab_lines() if CRON_TAG not in x] + [line])
+    for f in ("done", "failures"):
+        if os.path.exists(os.path.join(out, f)):
+            os.remove(os.path.join(out, f))
+    now = datetime.now()
+    log("已安裝排程（crontab -l 可以看到）")
+    log(f"  時段：{window}；每 {args.every} 分鐘檢查一次；dataset：{','.join(wanted) if wanted else '全部'}")
+    if timewindow.is_open(segs, now):
+        log(f"  現在就在時段內，{args.every} 分鐘內開始")
+    else:
+        nxt = timewindow.opens_at(segs, now)
+        log(f"  下次開始：{nxt:%m-%d（%a）%H:%M}" if nxt else "  這個時段永遠不會開始")
+    log(f"  報告與每天的日誌：{out}；進度：schedule-status；取消：schedule-remove")
+    return 0
+
+
+def schedule_status(args):
+    lines = [x for x in crontab_lines() if CRON_TAG in x]
+    print("crontab：" + ("已安裝" if lines else "沒有安裝"))
+    for x in lines:
+        print(f"  {x}")
+    out = scheduled_out(args)
+    if lines:
+        try:
+            parts = shlex.split(lines[0].split(CRON_TAG)[0])
+            window = parts[parts.index("--window") + 1]
+            out = parts[parts.index("--out") + 1]
+            segs, now = timewindow.parse(window), datetime.now()
+            if timewindow.is_open(segs, now):
+                end = timewindow.closes_at(segs, now)
+                print(f"現在：時段內（{window}），到 {end:%m-%d（%a）%H:%M}" if end else f"現在：時段內（{window}）")
+            else:
+                nxt = timewindow.opens_at(segs, now)
+                print(f"現在：時段外（{window}），下次開始 {nxt:%m-%d（%a）%H:%M}" if nxt else f"現在：時段外（{window}）")
+        except (ValueError, IndexError):
+            pass
+    lock = lock_run(os.path.join(out, "x"))
+    print("執行中：" + ("否" if lock else "是"))
+    if lock:
+        lock.close()
+    for name, label in (("done", "已全部完成"), ("failures", "連續失敗次數（達 3 次會停止排程）")):
+        p = os.path.join(out, name)
+        if os.path.exists(p):
+            with open(p) as f:
+                print(f"{label}：{f.read().strip() or '是'}")
+    logs = sorted(x for x in os.listdir(out) if x.startswith("schedule-") and x.endswith(".log")) if os.path.isdir(out) else []
+    if logs:
+        print(f"最近的日誌 {os.path.join(out, logs[-1])}：")
+        with open(os.path.join(out, logs[-1]), encoding="utf-8") as f:
+            for x in f.read().splitlines()[-10:]:
+                print(f"  {x}")
+    if os.path.exists(os.path.join(out, "report.md")):
+        print(f"報告：{os.path.join(out, 'report.md')}")
+    return 0
+
+
+def after_scheduled(out, code):
+    """--scheduled 的 run 結束後：完成就移除排程，連續失敗 3 次也移除。"""
+    fp = os.path.join(out, "failures")
+    if code == 0:
+        open(os.path.join(out, "done"), "w").close()
+        if os.path.exists(fp):
+            os.remove(fp)
+        schedule_remove("全部一致")
+    elif code == 3:
+        if os.path.exists(fp):
+            os.remove(fp)
+    elif code == 1:
+        n = 1
+        if os.path.exists(fp):
+            with open(fp) as f:
+                n = int(f.read().strip() or 0) + 1
+        with open(fp, "w") as f:
+            f.write(str(n))
+        log(f"第 {n} 次連續失敗")
+        if n >= 3:
+            schedule_remove(f"連續 {n} 次失敗，看 {os.path.join(out, 'report.md')} 修好再 schedule-install")
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="migrate-datasets.py", add_help=True,
                                  description="把舊版 RAGFlow 的 dataset 搬到 1.0（說明見檔頭）")
-    ap.add_argument("action", choices=["list", "plan", "run", "verify"])
-    ap.add_argument("--src", required=True)
-    ap.add_argument("--src-key", required=True)
+    ap.add_argument("action", choices=["list", "plan", "run", "verify",
+                                       "schedule-install", "schedule-status", "schedule-remove"])
+    ap.add_argument("--src")
+    ap.add_argument("--src-key")
     ap.add_argument("--dst")
     ap.add_argument("--dst-key")
     ap.add_argument("--dataset")
@@ -476,16 +702,76 @@ def main(argv=None):
     ap.add_argument("--batch-timeout", type=int, default=120)
     ap.add_argument("--no-parse", action="store_true")
     ap.add_argument("--out")
+    ap.add_argument("--window")
+    ap.add_argument("--every", type=int, default=15)
+    ap.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+
+    if args.action == "schedule-status":
+        return schedule_status(args)
+    if args.action == "schedule-remove":
+        schedule_remove("手動移除")
+        return 0
+    if not (args.src and args.src_key):
+        ap.error(f"{args.action} 需要 --src 與 --src-key")
 
     if args.batch < 1:
         ap.error("--batch 要是正整數")
     wanted = [s.strip() for s in args.dataset.split(",") if s.strip()] if args.dataset else None
-    if args.action == "run" and wanted is None and not args.all:
-        ap.error("run 要搭配 --dataset <a,b> 或 --all（避免一不小心搬全部）")
+    if args.action in ("run", "schedule-install") and wanted is None and not args.all:
+        ap.error(f"{args.action} 要搭配 --dataset <a,b> 或 --all（避免一不小心搬全部）")
     if args.action != "list" and not (args.dst and args.dst_key):
         ap.error(f"{args.action} 需要 --dst 與 --dst-key")
+    if args.scheduled and not args.window:
+        ap.error("--scheduled 要搭配 --window")
+    if args.window:
+        try:
+            segs = timewindow.parse(args.window)
+        except ValueError as e:
+            ap.error(f"--window 寫錯：{e}")
+    if args.action == "schedule-install":
+        return schedule_install(args, wanted)
 
+    dl, out = Deadline(), args.out or default_out()
+    if args.action == "run":
+        if args.window:
+            now = datetime.now()
+            if not timewindow.is_open(segs, now):
+                if not args.scheduled:   # 排程每 15 分鐘叫一次，時段外不留紀錄
+                    nxt = timewindow.opens_at(segs, now)
+                    log(f"現在不在離峰時段（{args.window}），不跑；下次開始 "
+                        + (f"{nxt:%m-%d（%a）%H:%M}" if nxt else "：永不"))
+                return 3
+            end = timewindow.closes_at(segs, now)
+            dl = Deadline(end.timestamp() if end else None)
+        lock = lock_run(out)
+        if lock is None:
+            if not args.scheduled:
+                log("已經有一個 run 在跑（migrate-datasets.lock），這次不跑")
+            return 4
+        if not args.scheduled:
+            try:
+                return run_main(ap, args, wanted, dl, out)
+            finally:
+                lock.close()
+        # 排程：每天一個日誌檔；完成或連續失敗時移除排程
+        os.makedirs(out, exist_ok=True)
+        code, saved = 1, sys.stdout
+        with open(os.path.join(out, f"schedule-{datetime.now():%Y%m%d}.log"), "a", encoding="utf-8") as f:
+            sys.stdout = f
+            try:
+                log(f"===== 排程啟動（{args.window}）=====")
+                code = run_main(ap, args, wanted, dl, out)
+            finally:
+                after_scheduled(out, code)
+                log(f"===== 結束（結束代碼 {code}）=====")
+                sys.stdout = saved
+                lock.close()
+        return code
+    return run_main(ap, args, wanted, dl, out)
+
+
+def run_main(ap, args, wanted, dl, out):
     src = Side("來源", args.src, key_of(args.src_key))
     log(f"{src}")
     if args.action == "list":
@@ -506,21 +792,26 @@ def main(argv=None):
     results = []
     if args.action == "run":
         for d in chosen:
+            if dl.paused:
+                break
             try:
-                results.append(migrate_one(src, dst, d, args))
+                results.append(migrate_one(src, dst, d, args, dl))
             except RuntimeError as e:
                 log(f"   ✗ {d['name']}：{e}")
                 results.append({"name": d["name"], "src_id": d["id"], "uploaded": 0, "skipped": 0, "notes": [],
                                 "failed": [{"file": "（dataset）", "error": str(e)}],
                                 "parsed": {"done": 0, "failed": 0, "canceled": 0, "timeout": 0}})
     compare = [compare_one(src, dst, d) for d in chosen]
-    path = write_report(args.out or default_out(), src, dst, args, results, compare)
+    path = write_report(out, src, dst, args, results, compare, paused=dl.paused)
     bad = [c["name"] for c in compare if not row_ok(c)]
     failed = sum(len(r["failed"]) for r in results)
     log(f"報告：{path}")
     log(f"比對：{len(compare) - len(bad)}/{len(compare)} 個 dataset 一致" + (f"；不一致：{', '.join(bad)}" if bad else ""))
     if args.action == "run" and failed:
         log(f"有 {failed} 份文件失敗，見報告；修好後再跑一次 run 會接著做")
+    if dl.paused:
+        log("⏸ 離峰時段結束，暫停；下次 run（或排程）會接著做")
+        return 3
     return 1 if bad or failed else 0
 
 
